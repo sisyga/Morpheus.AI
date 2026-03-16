@@ -1,0 +1,11 @@
+{
+  "papersDir": "benchmark_papers",
+  "resultsDir": "benchmark_runs",
+  "model": "gpt-5.4",
+  "reasoningEffort": "xhigh",
+  "maxTurnsPerPaper": 30,
+  "pageRenderDpi": 150,
+  "representativeOutputFrames": 5,
+  "mcpCommand": ["python", "server.py"],
+  "skillPaths": [".agents/skills/morpheus/SKILL.md"]
+}

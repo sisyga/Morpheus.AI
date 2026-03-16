@@ -1,0 +1,1135 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from dotenv import load_dotenv
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    class FastMCP:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+        def tool(self):
+            def decorator(func):
+                return func
+
+            return decorator
+
+        def run(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("mcp is not installed. Install requirements before running the MCP server.")
+
+load_dotenv()
+
+REPO_ROOT = Path(__file__).resolve().parent
+RUNS_ROOT = Path(os.getenv("MORPHEUS_RUNS_DIR", REPO_ROOT / "runs")).expanduser()
+RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+
+MORPHEUS_BIN = os.getenv("MORPHEUS_BIN", "morpheus")
+MAX_TEXT_PREVIEW = 2_000
+MAX_READ_CHARS = 20_000
+
+REFERENCES_ROOT = REPO_ROOT / "references"
+REFERENCE_CATEGORIES = {
+    "CPM": REFERENCES_ROOT / "CPM",
+    "PDE": REFERENCES_ROOT / "PDE",
+    "ODE": REFERENCES_ROOT / "ODE",
+    "Multiscale": REFERENCES_ROOT / "Multiscale",
+    "Miscellaneous": REFERENCES_ROOT / "Miscellaneous",
+}
+
+mcp = FastMCP(
+    name="morpheus-mcp",
+    host="0.0.0.0",
+    port=0,
+    stateless_http=True,
+)
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _new_run_id() -> str:
+    return f"{_now_stamp()}_{uuid.uuid4().hex[:8]}"
+
+
+def _run_dir(run_id: str) -> Path:
+    run_path = RUNS_ROOT / run_id
+    run_path.mkdir(parents=True, exist_ok=True)
+    return run_path
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _write_text(path: Path, text: str) -> None:
+    _ensure_parent(path)
+    path.write_text(text, encoding="utf-8", errors="ignore")
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    _ensure_parent(path)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _read_text(path: Path, max_chars: int = MAX_READ_CHARS) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+
+
+def _merge_manifest(run_id: str, updates: Dict[str, Any]) -> Path:
+    manifest_path = _run_dir(run_id) / "run_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    else:
+        manifest = {
+            "run_id": run_id,
+            "run_dir": str(_run_dir(run_id)),
+            "created_at": _now_iso(),
+        }
+    manifest.update(updates)
+    _write_json(manifest_path, manifest)
+    return manifest_path
+
+
+def _list_outputs(run_path: Path) -> Dict[str, List[str]]:
+    return {
+        "png": sorted(str(path) for path in run_path.rglob("*.png")),
+        "csv": sorted(str(path) for path in run_path.rglob("*.csv")),
+        "xml": sorted(str(path) for path in run_path.rglob("*.xml")),
+        "dot": sorted(str(path) for path in run_path.rglob("*.dot")),
+        "log": sorted(str(path) for path in run_path.rglob("*.log")),
+    }
+
+
+def _which(command: str) -> Optional[str]:
+    return shutil.which(command)
+
+
+def _run_cmd(
+    command: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout_s: Optional[int] = None,
+) -> Dict[str, Any]:
+    completed = subprocess.run(
+        list(command),
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=timeout_s,
+    )
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout or "",
+        "stderr": completed.stderr or "",
+        "command": list(command),
+    }
+
+
+def _sanitize_xml(xml: str) -> str:
+    xml = xml.strip()
+    xml = re.sub(r"^\s*```xml\s*", "", xml, flags=re.IGNORECASE)
+    xml = re.sub(r"\s*```\s*$", "", xml)
+    return xml.strip()
+
+
+def _looks_like_morpheus_xml(xml: str) -> bool:
+    return "<MorpheusModel" in xml and "</MorpheusModel>" in xml
+
+
+def _poppler_extract_text(pdf_path: Path) -> Optional[str]:
+    if not _which("pdftotext"):
+        return None
+    result = _run_cmd(["pdftotext", "-layout", str(pdf_path), "-"])
+    if result["returncode"] != 0 or not result["stdout"].strip():
+        return None
+    return result["stdout"]
+
+
+def _python_extract_text(pdf_path: Path) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Could not extract PDF text. Install pypdf or provide Poppler's pdftotext."
+        ) from exc
+
+    reader = PdfReader(str(pdf_path))
+    chunks: List[str] = []
+    for page in reader.pages:
+        try:
+            chunks.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n\n".join(chunks).strip()
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    text = _poppler_extract_text(pdf_path)
+    if text is not None:
+        return text.strip()
+    return _python_extract_text(pdf_path)
+
+
+def _render_with_poppler(
+    pdf_path: Path,
+    out_dir: Path,
+    pages: Sequence[int],
+    dpi: int,
+) -> List[Path]:
+    rendered: List[Path] = []
+    if not _which("pdftoppm"):
+        return rendered
+
+    for page in pages:
+        prefix = out_dir / f"page_{page:04d}"
+        result = _run_cmd(
+            [
+                "pdftoppm",
+                "-f",
+                str(page),
+                "-l",
+                str(page),
+                "-r",
+                str(dpi),
+                "-png",
+                str(pdf_path),
+                str(prefix),
+            ]
+        )
+        if result["returncode"] != 0:
+            continue
+        candidates = sorted(out_dir.glob(f"{prefix.name}*.png"))
+        if candidates:
+            target = out_dir / f"page_{page:04d}.png"
+            if candidates[0] != target:
+                candidates[0].replace(target)
+                for extra in candidates[1:]:
+                    extra.unlink(missing_ok=True)
+            rendered.append(target)
+    return rendered
+
+
+def _render_with_pymupdf(
+    pdf_path: Path,
+    out_dir: Path,
+    pages: Sequence[int],
+    dpi: int,
+) -> List[Path]:
+    try:
+        import fitz  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Could not render PDF pages. Install PyMuPDF or provide Poppler's pdftoppm."
+        ) from exc
+
+    doc = fitz.open(str(pdf_path))
+    scale = dpi / 72.0
+    matrix = fitz.Matrix(scale, scale)
+    rendered: List[Path] = []
+    for page_num in pages:
+        pix = doc.load_page(page_num - 1).get_pixmap(matrix=matrix, alpha=False)
+        out_path = out_dir / f"page_{page_num:04d}.png"
+        pix.save(str(out_path))
+        rendered.append(out_path)
+    return rendered
+
+
+def _render_pdf_pages(
+    pdf_path: Path,
+    out_dir: Path,
+    pages: Sequence[int],
+    dpi: int,
+) -> List[Path]:
+    rendered = _render_with_poppler(pdf_path, out_dir, pages, dpi)
+    if rendered:
+        return rendered
+    return _render_with_pymupdf(pdf_path, out_dir, pages, dpi)
+
+
+def _parse_pdf_page_count(pdf_path: Path) -> int:
+    if _which("pdfinfo"):
+        result = _run_cmd(["pdfinfo", str(pdf_path)])
+        if result["returncode"] == 0:
+            for line in result["stdout"].splitlines():
+                if line.startswith("Pages:"):
+                    return int(line.split(":", 1)[1].strip())
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Could not determine PDF page count. Install pypdf or provide Poppler's pdfinfo."
+        ) from exc
+    return len(PdfReader(str(pdf_path)).pages)
+
+
+def _parse_pdfimages_output(raw_output: str) -> List[Dict[str, Any]]:
+    figures: List[Dict[str, Any]] = []
+    lines = [line for line in raw_output.splitlines() if line.strip()]
+    for line in lines[2:]:
+        parts = re.split(r"\s+", line.strip())
+        if len(parts) < 16:
+            continue
+        figures.append(
+            {
+                "page": int(parts[0]),
+                "num": int(parts[1]),
+                "type": parts[2],
+                "width": int(parts[3]),
+                "height": int(parts[4]),
+                "color": parts[5],
+                "encoding": parts[8],
+                "object_id": f"{parts[10]} {parts[11]}",
+                "x_ppi": int(parts[12]),
+                "y_ppi": int(parts[13]),
+                "size": parts[14],
+                "ratio": parts[15],
+            }
+        )
+    return figures
+
+
+def _list_pdf_figures(pdf_path: Path) -> List[Dict[str, Any]]:
+    if not _which("pdfimages"):
+        return []
+    result = _run_cmd(["pdfimages", "-list", str(pdf_path)])
+    if result["returncode"] != 0:
+        return []
+    return _parse_pdfimages_output(result["stdout"])
+
+
+def _infer_reference_categories_from_text(text: str) -> Dict[str, Any]:
+    lower = text.lower()
+    scores = {"CPM": 0, "PDE": 0, "ODE": 0, "Multiscale": 0}
+
+    cpm_keywords = [
+        "cellular potts",
+        "cpm",
+        "adhesion",
+        "contact energy",
+        "surface constraint",
+        "cell sorting",
+        "motility",
+    ]
+    pde_keywords = [
+        "reaction-diffusion",
+        "diffusion",
+        "morphogen",
+        "concentration field",
+        "gradient",
+    ]
+    ode_keywords = [
+        "ode",
+        "ordinary differential equation",
+        "kinetic model",
+        "gene regulatory",
+        "signaling network",
+    ]
+    multiscale_keywords = [
+        "multiscale",
+        "hybrid",
+        "cellular potts model",
+        "chemokine",
+        "feedback loop",
+    ]
+
+    scores["CPM"] += sum(keyword in lower for keyword in cpm_keywords)
+    scores["PDE"] += sum(keyword in lower for keyword in pde_keywords)
+    scores["ODE"] += sum(keyword in lower for keyword in ode_keywords)
+    scores["Multiscale"] += sum(keyword in lower for keyword in multiscale_keywords)
+
+    selected = [name for name, score in scores.items() if score > 0]
+    if not selected:
+        selected = ["Miscellaneous"]
+
+    return {"scores": scores, "selected_categories": selected}
+
+
+def _validate_xml_completeness(xml: str) -> Dict[str, Any]:
+    cleaned = _sanitize_xml(xml)
+    checks = {
+        "has_root": "<MorpheusModel" in cleaned and "</MorpheusModel>" in cleaned,
+        "has_description": "<Description>" in cleaned and "</Description>" in cleaned,
+        "has_space": "<Space>" in cleaned and "</Space>" in cleaned,
+        "has_time": "<Time>" in cleaned and "</Time>" in cleaned,
+        "has_analysis": "<Analysis>" in cleaned and "</Analysis>" in cleaned,
+        "has_gnuplotter": "<Gnuplotter" in cleaned and "<Terminal name=\"png\"" in cleaned,
+        "has_logger": "<Logger" in cleaned and "<TextOutput" in cleaned,
+        "has_model_graph": "<ModelGraph" in cleaned,
+        "has_version": 'version="4"' in cleaned or "version='4'" in cleaned,
+    }
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not checks["has_root"]:
+        errors.append("Missing MorpheusModel root element")
+    if not checks["has_description"]:
+        warnings.append("Missing Description section")
+    if not checks["has_space"]:
+        warnings.append("Missing Space section")
+    if not checks["has_time"]:
+        warnings.append("Missing Time section")
+    if not checks["has_analysis"]:
+        warnings.append("Missing Analysis section")
+    if checks["has_analysis"] and not checks["has_gnuplotter"]:
+        warnings.append("Analysis section is missing Gnuplotter PNG output")
+    if checks["has_analysis"] and not checks["has_logger"]:
+        warnings.append("Analysis section is missing Logger CSV output")
+    if checks["has_analysis"] and not checks["has_model_graph"]:
+        warnings.append("Analysis section is missing ModelGraph output")
+    if checks["has_root"] and not checks["has_version"]:
+        warnings.append("MorpheusModel is not version 4")
+
+    return {
+        **checks,
+        "valid": checks["has_root"],
+        "graph_generation_ready": checks["has_analysis"] and checks["has_gnuplotter"],
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def _extract_stop_time(xml_text: str) -> Optional[float]:
+    patterns = [
+        r'<StopTime\s+value\s*=\s*["\']?([\d.eE+-]+)["\']?\s*/?>',
+        r'<StopTime[^>]*>([\d.eE+-]+)</StopTime>',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, xml_text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def _count_time_lines(stdout_text: str) -> Tuple[int, List[float]]:
+    time_values: List[float] = []
+    pattern = re.compile(r"^Time:\s*<?([\d.eE+-]+)>?", re.IGNORECASE)
+    for line in stdout_text.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        try:
+            time_values.append(float(match.group(1)))
+        except ValueError:
+            continue
+    return len(time_values), time_values
+
+
+def _calculate_time_score(time_line_count: int) -> int:
+    if time_line_count == 0:
+        return 0
+    if time_line_count == 1:
+        return 1
+    if 1 < time_line_count < 101:
+        return 2
+    return 3
+
+
+def _count_error_lines(stderr_text: str) -> int:
+    stderr_text = stderr_text.strip()
+    if not stderr_text:
+        return 0
+    count = 0
+    patterns = [r"\[ERROR\]", r"\[FATAL\]", r"Error:", r"error:", r"Exception"]
+    for line in stderr_text.splitlines():
+        if not line.strip():
+            continue
+        if any(re.search(pattern, line) for pattern in patterns):
+            count += 1
+    return count if count > 0 else len([line for line in stderr_text.splitlines() if line.strip()])
+
+
+def _pick_evenly_spaced(items: Sequence[Path], limit: int) -> List[Path]:
+    if not items or limit <= 0:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[0]]
+
+    indices = [0]
+    for step in range(1, limit - 1):
+        ratio = step / (limit - 1)
+        indices.append(round(ratio * (len(items) - 1)))
+    indices.append(len(items) - 1)
+
+    ordered = sorted(set(indices))
+    return [items[index] for index in ordered][:limit]
+
+
+def _create_contact_sheet(image_paths: Sequence[Path], output_path: Path) -> Optional[Path]:
+    if not image_paths:
+        return None
+    try:
+        from PIL import Image, ImageOps  # type: ignore
+    except ImportError:
+        return None
+
+    thumbs: List[Any] = []
+    for path in image_paths:
+        try:
+            image = Image.open(path).convert("RGB")
+            image.thumbnail((320, 320))
+            thumbs.append(ImageOps.pad(image, (320, 320), color="white"))
+        except Exception:
+            continue
+
+    if not thumbs:
+        return None
+
+    columns = min(3, len(thumbs))
+    rows = math.ceil(len(thumbs) / columns)
+    sheet = Image.new("RGB", (columns * 320, rows * 320), color="white")
+    for index, thumb in enumerate(thumbs):
+        x = (index % columns) * 320
+        y = (index // columns) * 320
+        sheet.paste(thumb, (x, y))
+    _ensure_parent(output_path)
+    sheet.save(output_path)
+    return output_path
+
+
+def _sample_run_images(run_path: Path, limit: int) -> Dict[str, Any]:
+    pngs = sorted(run_path.rglob("*.png"))
+    primary = [path for path in pngs if path.name.startswith("plot_")]
+    logger = [path for path in pngs if path.name.startswith("logger_")]
+
+    selected_primary = _pick_evenly_spaced(primary, limit)
+    selected_logger: List[Path] = []
+    if logger:
+        selected_logger.append(logger[0])
+        if logger[-1] != logger[0]:
+            selected_logger.append(logger[-1])
+
+    selected = selected_primary + [path for path in selected_logger if path not in selected_primary]
+    return {
+        "all_png_count": len(pngs),
+        "primary_plot_count": len(primary),
+        "logger_plot_count": len(logger),
+        "selected": selected,
+    }
+
+
+@mcp.tool()
+def create_run(name: Optional[str] = None) -> Dict[str, Any]:
+    run_id = _new_run_id() if not name else f"{_now_stamp()}_{name}"
+    run_path = _run_dir(run_id)
+    manifest_path = _merge_manifest(
+        run_id,
+        {
+            "run_id": run_id,
+            "run_dir": str(run_path),
+            "created_at": _now_iso(),
+            "runs_root": str(RUNS_ROOT),
+        },
+    )
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "run_dir": str(run_path),
+        "runs_root": str(RUNS_ROOT),
+        "run_manifest_path": str(manifest_path),
+    }
+
+
+@mcp.tool()
+def extract_paper_text(pdf_path: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    pdf_file = Path(pdf_path).expanduser().resolve()
+    if not pdf_file.exists():
+        return {"ok": False, "error": f"PDF not found: {pdf_path}"}
+
+    if run_id is None:
+        run_id = _new_run_id()
+    run_path = _run_dir(run_id)
+
+    try:
+        text = _extract_pdf_text(pdf_file)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if not text.strip():
+        return {"ok": False, "error": "No text could be extracted from PDF"}
+
+    text_path = run_path / "paper.txt"
+    _write_text(text_path, text)
+
+    page_count = _parse_pdf_page_count(pdf_file)
+    suggestions = _infer_reference_categories_from_text(text[:50_000])
+    manifest_path = _merge_manifest(
+        run_id,
+        {
+            "paper_pdf_path": str(pdf_file),
+            "paper_text_path": str(text_path),
+            "paper_page_count": page_count,
+            "reference_suggestions": suggestions,
+        },
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "run_dir": str(run_path),
+        "pdf_path": str(pdf_file),
+        "text_path": str(text_path),
+        "page_count": page_count,
+        "text_preview": text[:MAX_TEXT_PREVIEW],
+        "reference_suggestions": suggestions,
+        "run_manifest_path": str(manifest_path),
+    }
+
+
+@mcp.tool()
+def render_pdf_pages(
+    pdf_path: str,
+    run_id: Optional[str] = None,
+    pages: Optional[List[int]] = None,
+    dpi: int = 150,
+    max_pages: Optional[int] = None,
+) -> Dict[str, Any]:
+    pdf_file = Path(pdf_path).expanduser().resolve()
+    if not pdf_file.exists():
+        return {"ok": False, "error": f"PDF not found: {pdf_path}"}
+
+    if run_id is None:
+        run_id = _new_run_id()
+    run_path = _run_dir(run_id)
+    out_dir = run_path / "paper_pages"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total_pages = _parse_pdf_page_count(pdf_file)
+    selected_pages = pages or list(range(1, total_pages + 1))
+    selected_pages = [page for page in selected_pages if 1 <= page <= total_pages]
+    if max_pages is not None:
+        selected_pages = selected_pages[:max_pages]
+
+    try:
+        rendered_paths = _render_pdf_pages(pdf_file, out_dir, selected_pages, dpi)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    page_entries = [
+        {"page": page, "path": str(path)}
+        for page, path in zip(selected_pages, rendered_paths)
+    ]
+    manifest_path = run_path / "paper_page_manifest.json"
+    _write_json(
+        manifest_path,
+        {
+            "pdf_path": str(pdf_file),
+            "dpi": dpi,
+            "pages": page_entries,
+            "generated_at": _now_iso(),
+        },
+    )
+    _merge_manifest(
+        run_id,
+        {
+            "paper_page_manifest_path": str(manifest_path),
+            "paper_page_image_count": len(page_entries),
+        },
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "pdf_path": str(pdf_file),
+        "dpi": dpi,
+        "pages": page_entries,
+        "manifest_path": str(manifest_path),
+    }
+
+
+@mcp.tool()
+def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    pdf_file = Path(pdf_path).expanduser().resolve()
+    if not pdf_file.exists():
+        return {"ok": False, "error": f"PDF not found: {pdf_path}"}
+
+    if run_id is None:
+        run_id = _new_run_id()
+    run_path = _run_dir(run_id)
+
+    figures = _list_pdf_figures(pdf_file)
+    manifest_path = run_path / "paper_figure_manifest.json"
+    _write_json(
+        manifest_path,
+        {
+            "pdf_path": str(pdf_file),
+            "generated_at": _now_iso(),
+            "figures": figures,
+        },
+    )
+    _merge_manifest(
+        run_id,
+        {
+            "paper_figure_manifest_path": str(manifest_path),
+            "paper_figure_count": len(figures),
+        },
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "pdf_path": str(pdf_file),
+        "figure_count": len(figures),
+        "figures": figures,
+        "manifest_path": str(manifest_path),
+        "note": (
+            "This is a PDF image-object manifest. Use rendered page images for multimodal inspection "
+            "instead of assuming every embedded object is a meaningful figure."
+        ),
+    }
+
+
+@mcp.tool()
+def list_references(category: Optional[str] = None) -> Dict[str, Any]:
+    categories = {category: REFERENCE_CATEGORIES.get(category)} if category else REFERENCE_CATEGORIES
+    results: Dict[str, List[str]] = {}
+    for name, directory in categories.items():
+        if not directory or not directory.exists():
+            continue
+        results[name] = sorted(
+            path.name
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix in {".xml", ".txt", ".tif", ".tiff"}
+        )
+    return {"ok": True, "categories": results}
+
+
+@mcp.tool()
+def read_reference(category: str, name: str, max_chars: int = MAX_READ_CHARS) -> Dict[str, Any]:
+    directory = REFERENCE_CATEGORIES.get(category)
+    if not directory:
+        return {
+            "ok": False,
+            "error": f"Unknown category: {category}. Valid categories: {list(REFERENCE_CATEGORIES)}",
+        }
+    path = (directory / name).resolve()
+    if not path.exists() or not path.is_file():
+        return {"ok": False, "error": f"Reference not found: {category}/{name}"}
+    if directory not in path.parents:
+        return {"ok": False, "error": "Invalid reference path"}
+
+    content = _read_text(path, max_chars)
+    return {
+        "ok": True,
+        "category": category,
+        "name": name,
+        "path": str(path),
+        "content": content,
+        "validation": _validate_xml_completeness(content) if path.suffix == ".xml" else None,
+    }
+
+
+@mcp.tool()
+def validate_model_xml(xml_content: str) -> Dict[str, Any]:
+    validation = _validate_xml_completeness(xml_content)
+    return {"ok": validation["valid"], **validation}
+
+
+@mcp.tool()
+def write_model_xml(
+    xml_content: str,
+    run_id: Optional[str] = None,
+    file_name: str = "model.xml",
+) -> Dict[str, Any]:
+    cleaned = _sanitize_xml(xml_content)
+    if not _looks_like_morpheus_xml(cleaned):
+        return {
+            "ok": False,
+            "error": "Provided XML does not look like a MorpheusModel document",
+        }
+
+    if run_id is None:
+        run_id = _new_run_id()
+    run_path = _run_dir(run_id)
+    xml_path = run_path / file_name
+    version_dir = run_path / "xml_versions"
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_versions = sorted(version_dir.glob("model_v*.xml"))
+    version_index = len(existing_versions) + 1
+    version_path = version_dir / f"model_v{version_index:03d}.xml"
+
+    _write_text(xml_path, cleaned)
+    _write_text(version_path, cleaned)
+
+    validation = _validate_xml_completeness(cleaned)
+    manifest_path = _merge_manifest(
+        run_id,
+        {
+            "current_model_xml_path": str(xml_path),
+            "latest_xml_version_path": str(version_path),
+            "xml_version_count": version_index,
+            "last_xml_validation": validation,
+        },
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "xml_path": str(xml_path),
+        "version_path": str(version_path),
+        "validation": validation,
+        "run_manifest_path": str(manifest_path),
+    }
+
+
+@mcp.tool()
+def run_morpheus_model(
+    xml_path: str,
+    run_id: Optional[str] = None,
+    threads: Optional[int] = None,
+) -> Dict[str, Any]:
+    xml_file = Path(xml_path).expanduser().resolve()
+    if not xml_file.exists():
+        return {"ok": False, "error": f"XML not found: {xml_path}"}
+
+    if run_id is None:
+        run_id = xml_file.parent.name
+    run_path = _run_dir(run_id)
+
+    command = [MORPHEUS_BIN, "-f", str(xml_file), "--outdir", str(run_path)]
+    if threads:
+        command.extend(["--num-threads", str(threads)])
+
+    try:
+        result = _run_cmd(command, cwd=xml_file.parent, timeout_s=None)
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": f"Morpheus binary not found: {MORPHEUS_BIN}",
+            "command": command,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "command": command}
+
+    stdout_path = run_path / "stdout.log"
+    stderr_path = run_path / "stderr.log"
+    _write_text(stdout_path, result["stdout"])
+    _write_text(stderr_path, result["stderr"])
+
+    outputs = _list_outputs(run_path)
+    primary_pngs = [path for path in outputs["png"] if Path(path).name.startswith("plot_")]
+    logger_pngs = [path for path in outputs["png"] if Path(path).name.startswith("logger_")]
+    manifest_path = _merge_manifest(
+        run_id,
+        {
+            "last_run_at": _now_iso(),
+            "last_run_command": command,
+            "stdout_log_path": str(stdout_path),
+            "stderr_log_path": str(stderr_path),
+            "last_run_returncode": result["returncode"],
+            "last_run_png_count": len(outputs["png"]),
+            "last_run_csv_count": len(outputs["csv"]),
+        },
+    )
+
+    ok = result["returncode"] == 0
+    return {
+        "ok": ok,
+        "run_id": run_id,
+        "xml_path": str(xml_file),
+        "run_dir": str(run_path),
+        "command": command,
+        "returncode": result["returncode"],
+        "stdout": result["stdout"][:MAX_READ_CHARS],
+        "stderr": result["stderr"][:MAX_READ_CHARS],
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "outputs": outputs,
+        "png_count": len(outputs["png"]),
+        "csv_count": len(outputs["csv"]),
+        "primary_plot_count": len(primary_pngs),
+        "logger_plot_count": len(logger_pngs),
+        "run_manifest_path": str(manifest_path),
+        "message": "Morpheus run completed" if ok else "Morpheus run failed",
+    }
+
+
+@mcp.tool()
+def summarize_morpheus_run(run_id: str) -> Dict[str, Any]:
+    run_path = _run_dir(run_id)
+    outputs = _list_outputs(run_path)
+    stdout_path = run_path / "stdout.log"
+    stderr_path = run_path / "stderr.log"
+    xml_path = run_path / "model.xml"
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "run_dir": str(run_path),
+        "outputs": outputs,
+        "png_count": len(outputs["png"]),
+        "csv_count": len(outputs["csv"]),
+        "xml_count": len(outputs["xml"]),
+        "stdout_path": str(stdout_path) if stdout_path.exists() else None,
+        "stderr_path": str(stderr_path) if stderr_path.exists() else None,
+        "stdout_preview": _read_text(stdout_path) if stdout_path.exists() else "",
+        "stderr_preview": _read_text(stderr_path) if stderr_path.exists() else "",
+        "xml_path": str(xml_path) if xml_path.exists() else None,
+    }
+
+
+@mcp.tool()
+def sample_output_images(
+    run_id: str,
+    limit: int = 5,
+    create_contact_sheet: bool = False,
+) -> Dict[str, Any]:
+    run_path = _run_dir(run_id)
+    sample = _sample_run_images(run_path, limit)
+    selected_paths = [str(path) for path in sample["selected"]]
+    contact_sheet_path: Optional[str] = None
+
+    if create_contact_sheet and sample["selected"]:
+        output_path = run_path / "sample_contact_sheet.png"
+        created = _create_contact_sheet(sample["selected"], output_path)
+        if created:
+            contact_sheet_path = str(created)
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "selected_images": selected_paths,
+        "primary_plot_count": sample["primary_plot_count"],
+        "logger_plot_count": sample["logger_plot_count"],
+        "all_png_count": sample["all_png_count"],
+        "contact_sheet_path": contact_sheet_path,
+    }
+
+
+@mcp.tool()
+def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
+    run_path = _run_dir(run_id)
+    xml_path = run_path / "model.xml"
+    stdout_path = run_path / "stdout.log"
+    stderr_path = run_path / "stderr.log"
+    evaluation_json = run_path / "technical_evaluation.json"
+    evaluation_txt = run_path / "technical_evaluation.txt"
+
+    xml_text = _read_text(xml_path, max_chars=1_000_000)
+    stdout_text = _read_text(stdout_path, max_chars=1_000_000)
+    stderr_text = _read_text(stderr_path, max_chars=1_000_000)
+    outputs = _list_outputs(run_path)
+    validation = _validate_xml_completeness(xml_text) if xml_text else {}
+
+    error_count = _count_error_lines(stderr_text)
+    model_graph_present = any(Path(path).name == "model_graph.dot" for path in outputs["dot"])
+    time_lines, time_values = _count_time_lines(stdout_text)
+    time_score = _calculate_time_score(time_lines)
+    stop_time = _extract_stop_time(xml_text) if xml_text else None
+    last_time = time_values[-1] if time_values else None
+    stop_time_match = stop_time is not None and last_time is not None and abs(stop_time - last_time) < 1e-6
+    png_count = len(outputs["png"])
+    csv_count = len(outputs["csv"])
+    results_score = 1 if (png_count > 0 or csv_count > 0) else 0
+    bonus_many_results = 1 if png_count >= 10 else 0
+
+    raw_score = (
+        -error_count
+        + (1 if model_graph_present else 0)
+        + time_score
+        + (1 if stop_time_match else 0)
+        + results_score
+        + bonus_many_results
+    )
+    total_score = max(0, min(7, raw_score))
+
+    breakdown = {
+        "xml_error_count": error_count,
+        "xml_error_penalty": -error_count,
+        "model_graph_present": model_graph_present,
+        "model_graph_score": 1 if model_graph_present else 0,
+        "time_lines_count": time_lines,
+        "time_score": time_score,
+        "time_values_sample": time_values[:5],
+        "last_time_value": last_time,
+        "stop_time": stop_time,
+        "stop_time_match": stop_time_match,
+        "stop_time_score": 1 if stop_time_match else 0,
+        "results_generated": png_count > 0 or csv_count > 0,
+        "png_count": png_count,
+        "csv_count": csv_count,
+        "results_score": results_score,
+        "bonus_many_results": bonus_many_results,
+        "xml_validation": validation,
+    }
+    payload = {
+        "ok": True,
+        "run_id": run_id,
+        "total_score": total_score,
+        "max_possible_score": 7,
+        "score_percentage": round((total_score / 7) * 100, 2),
+        "breakdown": breakdown,
+        "evaluation_json_path": str(evaluation_json),
+        "evaluation_txt_path": str(evaluation_txt),
+        "generated_at": _now_iso(),
+    }
+    _write_json(evaluation_json, payload)
+    _write_text(
+        evaluation_txt,
+        "\n".join(
+            [
+                "============================================================",
+                "MORPHEUS TECHNICAL EVALUATION",
+                "============================================================",
+                f"Run ID: {run_id}",
+                f"Timestamp: {payload['generated_at']}",
+                "",
+                f"TOTAL SCORE: {total_score} / 7 ({payload['score_percentage']}%)",
+                "",
+                f"Error penalty: {-error_count}",
+                f"Model graph: {1 if model_graph_present else 0}/1",
+                f"Time progression: {time_score}/3",
+                f"StopTime match: {1 if stop_time_match else 0}/1",
+                f"Result files: {results_score}/1",
+                f"Bonus (10+ PNGs): {bonus_many_results}/1",
+                "",
+                f"PNG files: {png_count}",
+                f"CSV files: {csv_count}",
+            ]
+        ),
+    )
+    _merge_manifest(
+        run_id,
+        {
+            "technical_evaluation_json_path": str(evaluation_json),
+            "technical_evaluation_txt_path": str(evaluation_txt),
+            "technical_score": total_score,
+        },
+    )
+    return payload
+
+
+@mcp.tool()
+def read_file_text(path: str, max_chars: int = MAX_READ_CHARS) -> Dict[str, Any]:
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.exists() or not file_path.is_file():
+        return {"ok": False, "error": f"File not found: {path}"}
+    return {"ok": True, "path": str(file_path), "text": _read_text(file_path, max_chars)}
+
+
+def read_pdf(pdf_path: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    return extract_paper_text(pdf_path=pdf_path, run_id=run_id)
+
+
+def suggest_references(run_id: str) -> Dict[str, Any]:
+    paper_path = _run_dir(run_id) / "paper.txt"
+    if not paper_path.exists():
+        return {"ok": False, "error": "paper.txt not found for this run"}
+    text = _read_text(paper_path, 50_000)
+    suggestions = _infer_reference_categories_from_text(text)
+    available = {
+        category: sorted(path.name for path in REFERENCE_CATEGORIES[category].iterdir() if path.is_file())
+        for category in suggestions["selected_categories"]
+        if category in REFERENCE_CATEGORIES
+    }
+    return {
+        "ok": True,
+        "suggested_categories": suggestions["selected_categories"],
+        "scores": suggestions["scores"],
+        "available_references": available,
+    }
+
+
+def generate_xml_from_text(
+    model_xml: str,
+    run_id: Optional[str] = None,
+    file_name: str = "model.xml",
+) -> Dict[str, Any]:
+    return write_model_xml(xml_content=model_xml, run_id=run_id, file_name=file_name)
+
+
+def save_model_xml(
+    xml_content: str,
+    run_id: Optional[str] = None,
+    file_name: str = "model.xml",
+) -> Dict[str, Any]:
+    return write_model_xml(xml_content=xml_content, run_id=run_id, file_name=file_name)
+
+
+def run_morpheus(xml_path: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    return run_morpheus_model(xml_path=xml_path, run_id=run_id)
+
+
+def get_run_summary(run_id: str) -> Dict[str, Any]:
+    return summarize_morpheus_run(run_id=run_id)
+
+
+def evaluation(run_id: str) -> Dict[str, Any]:
+    return evaluate_technical_run(run_id=run_id)
+
+
+def auto_fix_and_rerun(run_id: str) -> Dict[str, Any]:
+    run_path = _run_dir(run_id)
+    xml_path = run_path / "model.xml"
+    stderr_path = run_path / "stderr.log"
+    stdout_path = run_path / "stdout.log"
+    xml_text = _read_text(xml_path, max_chars=1_000_000)
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "current_xml_path": str(xml_path) if xml_path.exists() else None,
+        "current_xml": xml_text,
+        "stderr": _read_text(stderr_path, max_chars=1_000_000),
+        "stdout": _read_text(stdout_path, max_chars=1_000_000),
+        "validation": _validate_xml_completeness(xml_text) if xml_text else None,
+        "message": "Legacy compatibility helper only. Inspect the logs, update XML, and rerun manually.",
+    }
+
+
+def run_xml_once(xml_content: str) -> Dict[str, Any]:
+    saved = write_model_xml(xml_content=xml_content)
+    if not saved.get("ok"):
+        return saved
+    return run_morpheus_model(xml_path=saved["xml_path"], run_id=saved["run_id"])
+
+
+def pdf_to_morpheus_pipeline(pdf_path: str) -> Dict[str, Any]:
+    extracted = extract_paper_text(pdf_path=pdf_path)
+    if not extracted.get("ok"):
+        return extracted
+    refs = suggest_references(extracted["run_id"])
+    return {
+        "ok": True,
+        "run_id": extracted["run_id"],
+        "run_dir": extracted["run_dir"],
+        "pdf_path": extracted["pdf_path"],
+        "paper_text": extracted["text_path"],
+        "paper_text_preview": extracted["text_preview"],
+        "suggested_reference_categories": refs.get("suggested_categories", []),
+        "available_references": refs.get("available_references", {}),
+        "next_steps": [
+            "Use list_references(category) and read_reference(category, name) to study examples.",
+            "Use write_model_xml() to save Morpheus XML.",
+            "Use run_morpheus_model() and evaluate_technical_run() after writing the model.",
+        ],
+    }
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")

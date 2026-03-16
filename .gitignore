@@ -3,6 +3,7 @@
 .venv1/
 __pycache__/
 *.pyc
+node_modules/
 
 # macOS
 .DS_Store
@@ -19,4 +20,6 @@ MWE/
 
 # Local files
 correction.json
+runs/
+benchmark_runs/
 
