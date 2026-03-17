@@ -3,7 +3,7 @@
   "resultsDir": "benchmark_runs",
   "model": "gpt-5.4",
   "reasoningEffort": "xhigh",
-  "maxTurnsPerPaper": 30,
+  "maxTurnsPerPaper": 5,
   "pageRenderDpi": 150,
   "representativeOutputFrames": 5,
   "mcpCommand": ["python", "server.py"],

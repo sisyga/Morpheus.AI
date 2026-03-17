@@ -82,7 +82,18 @@ export class BenchmarkRunner {
     const results: PaperRunResult[] = [];
 
     for (const pdfPath of papers) {
-      results.push(await this.processPaper(pdfPath));
+      try {
+        results.push(await this.processPaper(pdfPath));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        results.push(
+          failedResult(
+            path.basename(pdfPath),
+            pdfPath,
+            `Unhandled runner error: ${message}`,
+          ),
+        );
+      }
     }
 
     const completed = results.filter((result) => result.status === "completed").length;
@@ -202,7 +213,20 @@ export class BenchmarkRunner {
         outputImagePaths,
         contactSheetPath,
       );
-      const turn = await collectTurn(thread, input);
+      let turn: CollectedTurn;
+      try {
+        turn = await collectTurn(thread, input);
+      } catch (error) {
+        return failedResult(
+          paper,
+          pdfPath,
+          `Failed during Codex turn: ${error instanceof Error ? error.message : String(error)}`,
+          runId,
+          runDir,
+          createRun.run_manifest_path,
+          thread.id,
+        );
+      }
       await writeTranscript(path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}.jsonl`), turn.events);
       completedCycles = cycle;
 
@@ -247,10 +271,10 @@ export class BenchmarkRunner {
       }
 
       if (cycleResponse.status === "failed") {
-      status = "failed";
-      break;
+        status = "failed";
+        break;
+      }
     }
-  }
 
     const technical = (await this.bridge.invoke("evaluate_technical_run", {
       run_id: runId,
@@ -314,6 +338,9 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
   const items = new Map<string, ThreadItem>();
   let usage: CollectedTurn["usage"] = null;
   let finalResponse = "";
+  let turnCompleted = false;
+  let turnFailedMessage: string | null = null;
+  let recoverableStreamError: string | null = null;
 
   for await (const event of streamed.events) {
     events.push(event);
@@ -325,13 +352,30 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
     }
     if (event.type === "turn.completed") {
       usage = event.usage;
+      turnCompleted = true;
     }
     if (event.type === "turn.failed") {
-      throw new Error(event.error.message);
+      turnFailedMessage = event.error.message;
     }
     if (event.type === "error") {
+      if (isRecoverableStreamError(event.message)) {
+        recoverableStreamError = event.message;
+        continue;
+      }
       throw new Error(event.message);
     }
+  }
+
+  if (turnFailedMessage) {
+    throw new Error(turnFailedMessage);
+  }
+
+  if (!turnCompleted) {
+    throw new Error(
+      recoverableStreamError
+        ? `Turn stream ended before completion after transient stream errors: ${recoverableStreamError}`
+        : "Turn stream ended before completion.",
+    );
   }
 
   return {
@@ -344,6 +388,15 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
 
 function sanitizeStem(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]+/g, "_");
+}
+
+function isRecoverableStreamError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("reconnecting") ||
+    normalized.includes("stream disconnected before completion") ||
+    normalized.includes("websocket closed by server")
+  );
 }
 
 function average(values: number[]): number {
