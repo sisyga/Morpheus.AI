@@ -74,6 +74,7 @@ type PromptParams = {
   likelyFigurePages?: number[];
   cycle: number;
   previousSummary?: string;
+  previousReproductionScore?: number | null;
   technicalEvaluationPath?: string | null;
   paperImagePaths: string[];
   outputImagePaths: string[];
@@ -81,6 +82,26 @@ type PromptParams = {
 };
 
 export function buildCyclePrompt(params: PromptParams): string {
+  const metadataLines = [
+    `Benchmark paper: ${params.paperName}`,
+    `PDF path: ${params.pdfPath}`,
+    `Run ID: ${params.runId}`,
+    `Run directory: ${params.runDir}`,
+    `Paper text path: ${params.paperTextPath}`,
+    `Preferred paper page render DPI when needed: ${params.pageRenderDpi}`,
+    `Preferred Morpheus output image sample count when needed: ${params.representativeOutputFrames}`,
+    params.pageManifestPath ? `Page manifest path: ${params.pageManifestPath}` : "No page manifest exists yet.",
+    params.figureManifestPath
+      ? `Figure manifest path: ${params.figureManifestPath}`
+      : "No figure manifest exists yet.",
+    params.likelyFigurePages && params.likelyFigurePages.length > 0
+      ? `Likely figure pages: ${params.likelyFigurePages.join(", ")}`
+      : null,
+    `Host cycle: ${params.cycle}`,
+  ]
+    .filter((l): l is string => l !== null)
+    .join("\n");
+
   const paperImageSection =
     params.paperImagePaths.length > 0
       ? [
@@ -92,75 +113,104 @@ export function buildCyclePrompt(params: PromptParams): string {
           params.figureManifestPath
             ? "If you need visual paper inspection, use the figure manifest and render only specific pages with render_pdf_pages(pages=[...])."
             : "If you need visual paper inspection, render only specific pages with render_pdf_pages(pages=[...]).",
-        ].join("\n");
+        ].join(" ");
 
   const outputSection =
     params.outputImagePaths.length > 0
       ? [
           "Latest Morpheus outputs have been sampled and attached to this turn.",
           `Sampled output image paths: ${params.outputImagePaths.join(", ")}`,
-          params.contactSheetPath ? `Contact sheet path: ${params.contactSheetPath}` : "",
+          params.contactSheetPath ? `Contact sheet path: ${params.contactSheetPath}` : null,
         ]
-          .filter(Boolean)
+          .filter((l): l is string => l !== null)
           .join("\n")
       : "No Morpheus output images are attached to this turn. If you need visual inspection, call sample_output_images after a successful run.";
 
-  return [
-    `Benchmark paper: ${params.paperName}`,
-    `PDF path: ${params.pdfPath}`,
-    `Run ID: ${params.runId}`,
-    `Run directory: ${params.runDir}`,
-    `Paper text path: ${params.paperTextPath}`,
-    `Preferred paper page render DPI when needed: ${params.pageRenderDpi}`,
-    `Preferred Morpheus output image sample count when needed: ${params.representativeOutputFrames}`,
-    params.pageManifestPath ? `Page manifest path: ${params.pageManifestPath}` : "No page manifest exists yet.",
-    params.figureManifestPath ? `Figure manifest path: ${params.figureManifestPath}` : "No figure manifest exists yet.",
-    params.likelyFigurePages && params.likelyFigurePages.length > 0
-      ? `Likely figure pages: ${params.likelyFigurePages.join(", ")}`
-      : "",
-    `Host cycle: ${params.cycle}`,
-    "",
-    "Rules:",
-    "- Use the Morpheus skill as the source of modeling behavior.",
-    "- Do not edit repository source files. Only work inside the run directory via MCP tools.",
-    "- Use MCP tools for references, XML writing, Morpheus execution, run summaries, output sampling, and technical evaluation.",
-    "- Do not read SKILL.md through a file tool. The skill is already loaded.",
-    "- Start from paper text and references. Do not request paper page images unless you need visual inspection.",
-    "- Read paper.txt once at the start of the run, then reread it only if you need more detail later.",
-    "- Preserve executability first, then use the paper images and output images to judge reproduction quality.",
-    "- If you need paper figures, render only the specific pages you want to inspect, using the preferred DPI unless a different one is necessary.",
-    "- If you need Morpheus output images, call sample_output_images with the preferred sample count unless a different count is necessary.",
-    "- If you sample output images or render paper pages during this turn, the host may attach them in one immediate follow-up review turn within the same cycle.",
-    "- Do not assume previously attached images will be reattached in later host cycles. Request them again only if you still need them.",
-    "- If no model exists yet, create one, run Morpheus, and evaluate the technical score.",
-    "- If output images are attached and they reveal obvious mismatches, you may revise the model and rerun.",
-    "- Set needsAnotherImageReview=true only if, after this cycle and any immediate image follow-up, you still need another host cycle.",
-    "- Only return JSON matching the provided schema.",
-    "",
-    "Required tool sequence for the first workable model:",
-    "1. read_file_text(paper.txt).",
-    "2. list_references(...) and read_reference(...) for the closest Morpheus examples.",
+  const technicalSection = params.technicalEvaluationPath
+    ? `Latest technical evaluation path: ${params.technicalEvaluationPath}`
+    : "No technical evaluation is available yet.";
+
+  const dynamicSections = [paperImageSection, outputSection, technicalSection].join("\n\n");
+
+  // Cycle 2+: skip the static rule blocks and use a compact continuation reference instead.
+  if (params.cycle > 1) {
+    const reproScore =
+      params.previousReproductionScore != null
+        ? String(params.previousReproductionScore)
+        : "not yet scored";
+    const continuationBlock = [
+      "<cycle_continuation>",
+      `Continuing from cycle ${params.cycle - 1}. All rules, tool-persistence rules, dependency checks, completeness contract, and verification loop from cycle 1 remain in effect.`,
+      params.previousSummary ? `Previous summary: ${params.previousSummary}` : null,
+      `Previous reproduction score: ${reproScore}`,
+      "</cycle_continuation>",
+    ]
+      .filter((l): l is string => l !== null)
+      .join("\n");
+    return [metadataLines, continuationBlock, dynamicSections].join("\n\n");
+  }
+
+  // Cycle 1: full rule set using GPT-5.4 XML block structure.
+  const toolPersistenceBlock = [
+    "<tool_persistence_rules>",
+    "- Use the Morpheus skill as the source of modeling behavior. Do not read SKILL.md through a file tool; the skill is already loaded.",
+    "- Use MCP tools for references, XML writing, Morpheus execution, run summaries, output sampling, and technical evaluation. Do not edit repository source files.",
+    "- Do not stop early; keep calling tools until a valid model runs and technical evaluation passes.",
+    "- If a tool returns an error, diagnose from the error message and retry with a corrected input.",
+    "- Preserve executability first, then use paper images and output images to judge reproduction quality.",
+    "</tool_persistence_rules>",
+  ].join("\n");
+
+  const dependencyBlock = [
+    "<dependency_checks>",
+    "For the first workable model, follow this sequence:",
+    "1. read_file_text(paper.txt)",
+    "2. list_references(...) and read_reference(...) for the closest Morpheus examples",
     "3. write_model_xml(...)",
     "4. run_morpheus_model(...)",
     "5. summarize_morpheus_run(...)",
     "6. evaluate_technical_run(...)",
-    "",
-    paperImageSection,
-    "",
-    outputSection,
-    "",
-    params.technicalEvaluationPath
-      ? `Latest technical evaluation path: ${params.technicalEvaluationPath}`
-      : "No technical evaluation is available yet.",
-    params.previousSummary ? `Previous cycle summary: ${params.previousSummary}` : "",
-    "",
-    "Completion policy:",
-    "- status=completed only when you have both a technical result and a filled reproduction rubric.",
-    "- reproduction evidence strings must cite paper pages/figures and output files.",
-    "- If you are blocked by Morpheus execution or missing outputs, status=failed and reproduction may be null.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    "Read paper.txt once at the start; reread only if more detail is needed.",
+    "Render paper pages or sample output images only when visual inspection is needed; the host will attach them in an immediate follow-up review turn within the same cycle.",
+    "Do not assume previously attached images will be reattached in later cycles.",
+    "</dependency_checks>",
+  ].join("\n");
+
+  const completenessBlock = [
+    "<completeness_contract>",
+    "- Treat the task as incomplete until: a model runs, technical evaluation passes, and the reproduction rubric is filled.",
+    "- status=completed only when both technical_evaluation_path and a filled reproduction rubric with cited evidence exist.",
+    "- If Morpheus fails and cannot be recovered, set status=failed; reproduction may be null.",
+    "</completeness_contract>",
+  ].join("\n");
+
+  const verificationBlock = [
+    "<verification_loop>",
+    "Before setting status=completed:",
+    "- Confirm model.xml exists and ran without fatal errors.",
+    "- Confirm technical_evaluation_path exists.",
+    "- Confirm the reproduction rubric is fully filled with paper section/figure and output file citations.",
+    "- If any of these are missing, set status=in_progress and state what remains.",
+    "</verification_loop>",
+  ].join("\n");
+
+  const outputContractBlock = [
+    "<output_contract>",
+    "- Return exactly the JSON schema provided. No prose, no markdown fences.",
+    "- reproduction evidence strings must cite specific paper pages/figures and output files by name.",
+    "- Set needsAnotherImageReview=true only if you genuinely need another host cycle after this one.",
+    "</output_contract>",
+  ].join("\n");
+
+  return [
+    metadataLines,
+    toolPersistenceBlock,
+    dependencyBlock,
+    completenessBlock,
+    verificationBlock,
+    outputContractBlock,
+    dynamicSections,
+  ].join("\n\n");
 }
 
 type ImageReviewPromptParams = {
@@ -189,6 +239,10 @@ export function buildImageReviewPrompt(params: ImageReviewPromptParams): string 
     params.outputImagePaths.length > 0 ? `Attached output image paths: ${params.outputImagePaths.join(", ")}` : "",
     params.contactSheetPath ? `Attached contact sheet path: ${params.contactSheetPath}` : "",
     params.technicalEvaluationPath ? `Latest technical evaluation path: ${params.technicalEvaluationPath}` : "",
+    "",
+    "<available_tools>",
+    "If revision is needed: write_model_xml → run_morpheus_model → summarize_morpheus_run → evaluate_technical_run.",
+    "</available_tools>",
     "",
     "Return JSON matching the provided schema.",
   ]

@@ -52,6 +52,7 @@ type CollectedTurn = {
   usage: { input_tokens: number; cached_input_tokens: number; output_tokens: number } | null;
   events: ThreadEvent[];
   items: ThreadItem[];
+  error: string | null;
 };
 
 export class BenchmarkRunner {
@@ -179,6 +180,7 @@ export class BenchmarkRunner {
     let technicalEvaluationPath: string | null = null;
     let pageManifestPath: string | null = null;
     let lastSummary: string | undefined;
+    let lastReproductionScore: number | null = null;
     let finalCycle: AgentCycleResponse | null = null;
     let status: PaperRunResult["status"] = "max_turns";
     let completedCycles = 0;
@@ -197,6 +199,7 @@ export class BenchmarkRunner {
         likelyFigurePages: figureManifest.figure_pages,
         cycle,
         previousSummary: lastSummary,
+        previousReproductionScore: lastReproductionScore,
         technicalEvaluationPath,
         paperImagePaths: [],
         outputImagePaths: [],
@@ -204,21 +207,19 @@ export class BenchmarkRunner {
       });
 
       const input = buildTurnInput(prompt, [], [], null);
-      let turn: CollectedTurn;
-      try {
-        turn = await collectTurn(thread, input);
-      } catch (error) {
+      const turn = await collectTurn(thread, input);
+      await writeTranscript(path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}.jsonl`), turn.events);
+      if (turn.error) {
         return failedResult(
           paper,
           pdfPath,
-          `Failed during Codex turn: ${error instanceof Error ? error.message : String(error)}`,
+          `Failed during Codex turn: ${turn.error}`,
           runId,
           runDir,
           createRun.run_manifest_path,
           thread.id,
         );
       }
-      await writeTranscript(path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}.jsonl`), turn.events);
       completedCycles = cycle;
 
       let cycleResponse: AgentCycleResponse;
@@ -257,24 +258,22 @@ export class BenchmarkRunner {
           reviewInspection.outputImagePaths,
           reviewInspection.contactSheetPath,
         );
-        let reviewTurn: CollectedTurn;
-        try {
-          reviewTurn = await collectTurn(thread, reviewInput);
-        } catch (error) {
+        const reviewTurn = await collectTurn(thread, reviewInput);
+        await writeTranscript(
+          path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`),
+          reviewTurn.events,
+        );
+        if (reviewTurn.error) {
           return failedResult(
             paper,
             pdfPath,
-            `Failed during image review turn: ${error instanceof Error ? error.message : String(error)}`,
+            `Failed during image review turn: ${reviewTurn.error}`,
             runId,
             runDir,
             createRun.run_manifest_path,
             thread.id,
           );
         }
-        await writeTranscript(
-          path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`),
-          reviewTurn.events,
-        );
 
         try {
           cycleResponse = parseCycleResponse(reviewTurn.finalResponse);
@@ -296,6 +295,7 @@ export class BenchmarkRunner {
 
       finalCycle = cycleResponse;
       lastSummary = cycleResponse.summary;
+      lastReproductionScore = cycleResponse.reproduction?.total_score ?? null;
 
       const technical = (await this.bridge.invoke("evaluate_technical_run", {
         run_id: runId,
@@ -401,20 +401,19 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
         recoverableStreamError = event.message;
         continue;
       }
-      throw new Error(event.message);
+      return { finalResponse, usage, events, items: [...items.values()], error: event.message };
     }
   }
 
   if (turnFailedMessage) {
-    throw new Error(turnFailedMessage);
+    return { finalResponse, usage, events, items: [...items.values()], error: turnFailedMessage };
   }
 
   if (!turnCompleted) {
-    throw new Error(
-      recoverableStreamError
-        ? `Turn stream ended before completion after transient stream errors: ${recoverableStreamError}`
-        : "Turn stream ended before completion.",
-    );
+    const error = recoverableStreamError
+      ? `Turn stream ended before completion after transient stream errors: ${recoverableStreamError}`
+      : "Turn stream ended before completion.";
+    return { finalResponse, usage, events, items: [...items.values()], error };
   }
 
   return {
@@ -422,6 +421,7 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
     usage,
     events,
     items: [...items.values()],
+    error: null,
   };
 }
 
@@ -469,10 +469,7 @@ function collectInspectionArtifacts(items: ThreadItem[], runDir: string): Inspec
       continue;
     }
 
-    const payload =
-      toolItem.result?.structured_content?.result ??
-      toolItem.result?.structuredContent?.result ??
-      null;
+    const payload = toolItem.result?.structured_content ?? null;
     if (!payload || payload.ok === false) {
       continue;
     }
@@ -515,7 +512,8 @@ function resolveArtifactPath(runDir: string, value: string): string {
 }
 
 async function writeTranscript(outputPath: string, events: ThreadEvent[]): Promise<void> {
-  const content = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  const content = events.length > 0 ? `${events.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
   await writeFile(outputPath, content, "utf8");
 }
 
