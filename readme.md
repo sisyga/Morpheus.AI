@@ -42,9 +42,9 @@ For each PDF in `benchmark_papers/`, the runner:
 
 1. creates a dedicated run directory;
 2. extracts the paper text;
-3. renders paper pages to PNG so the agent can inspect figures and layout;
+3. detects likely figure pages but does not attach page images up front;
 4. exposes the Morpheus skill and MCP tools to Codex;
-5. lets the agent write MorpheusML, run Morpheus, inspect output images, and revise if needed;
+5. lets the agent write MorpheusML, run Morpheus, request specific paper pages or sampled output images only when needed, and revise if needed;
 6. records technical and reproduction-oriented evaluation files.
 
 Two score tracks are written for each paper:
@@ -124,9 +124,9 @@ Inside a paper run directory you will typically find:
 - `paper.txt`
   Extracted text from the benchmark PDF.
 - `paper_page_manifest.json`
-  The page images staged for multimodal inspection.
+  The page images rendered on demand for multimodal inspection.
 - `paper_figure_manifest.json`
-  Figure candidates extracted from the PDF.
+  A lightweight index of likely figure pages in the PDF.
 - `model.xml`
   The most recent Morpheus model produced by the agent.
 - `xml_versions/`
@@ -146,9 +146,10 @@ At the benchmark root, `benchmark_summary.json` aggregates the run status and sc
 
 - The benchmark uses local Codex authentication. It is intended to run with a locally authenticated Codex CLI rather than direct API-key billing in the harness.
 - Live web search is disabled during benchmark runs. The agent works from the staged paper assets, the local Morpheus reference material, and the Morpheus outputs generated in the run directory.
-- The agent is given both paper text and rendered page images. This matters because figures, schematics, and layout often contain information that is not captured well by plain text extraction.
-- The agent also inspects representative Morpheus output images before deciding whether a model is a reasonable reproduction.
+- The agent is given paper text up front. Paper page images are not attached by default; instead, the agent can request only the specific figure pages it wants to inspect.
+- The agent can also request representative Morpheus output images. When it does so, the runner attaches those images in an immediate follow-up review turn within the same host cycle.
 - A turn is one full host-controlled agent cycle for a paper, not one tool call. Within a single turn, Codex can read references, write XML, run Morpheus, inspect outputs, and return a structured decision about whether another cycle is needed.
+- Images are not automatically reattached in later cycles. If the agent still needs them, it must request them again.
 - The technical score is deterministic, but the reproduction report is a structured qualitative assessment returned by the agent from the staged evidence.
 - Results can vary between runs because the benchmark depends on an LLM-driven modeling loop. In practice, a one-paper smoke test is the best first check, and repeated full runs should be interpreted as distributions rather than perfectly fixed outputs.
 

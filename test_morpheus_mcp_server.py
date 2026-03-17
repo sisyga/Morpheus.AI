@@ -43,6 +43,17 @@ class MorpheusMcpServerTests(unittest.TestCase):
         self.assertEqual(len(result["selected_images"]), 7)
         self.assertEqual(result["primary_plot_count"], 10)
         self.assertEqual(result["logger_plot_count"], 2)
+        self.assertTrue(all(not Path(path).is_absolute() for path in result["selected_images"]))
+
+    def test_extract_stop_time_accepts_nonfirst_value_attribute(self) -> None:
+        xml = """
+        <MorpheusModel version="4">
+          <Time>
+            <StopTime symbol="t_stop" value="40"/>
+          </Time>
+        </MorpheusModel>
+        """
+        self.assertEqual(server._extract_stop_time(xml), 40.0)
 
     def test_evaluate_technical_run_preserves_legacy_score(self) -> None:
         run_path = server._run_dir("run_eval")

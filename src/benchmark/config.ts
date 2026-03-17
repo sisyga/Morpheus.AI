@@ -16,7 +16,7 @@ export async function loadConfig(configPath?: string): Promise<BenchmarkConfig> 
     resultsDir: path.resolve(process.cwd(), parsed.resultsDir ?? "benchmark_runs"),
     model: parsed.model ?? "gpt-5.4",
     reasoningEffort: parsed.reasoningEffort ?? "xhigh",
-    maxTurnsPerPaper: parsed.maxTurnsPerPaper ?? 30,
+    maxTurnsPerPaper: parsed.maxTurnsPerPaper ?? 5,
     pageRenderDpi: parsed.pageRenderDpi ?? 150,
     representativeOutputFrames: parsed.representativeOutputFrames ?? 5,
     mcpCommand: parsed.mcpCommand ?? ["python", "server.py"],

@@ -7,7 +7,7 @@ test("loadConfig reads the default benchmark config", async () => {
   const config = await loadConfig();
   assert.equal(config.model, "gpt-5.4");
   assert.equal(config.reasoningEffort, "xhigh");
-  assert.equal(config.maxTurnsPerPaper, 30);
+  assert.equal(config.maxTurnsPerPaper, 5);
   assert.equal(config.pageRenderDpi, 150);
   assert.ok(config.papersDir.endsWith("benchmark_papers"));
 });

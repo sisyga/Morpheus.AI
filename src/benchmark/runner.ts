@@ -4,12 +4,18 @@ import process from "node:process";
 
 import { Codex, type Thread, type ThreadEvent, type ThreadItem, type ThreadOptions, type UserInput } from "@openai/codex-sdk";
 
-import { buildCyclePrompt, FINAL_RESPONSE_SCHEMA, parseCycleResponse } from "./prompt.js";
+import {
+  buildCyclePrompt,
+  buildImageReviewPrompt,
+  FINAL_RESPONSE_SCHEMA,
+  parseCycleResponse,
+} from "./prompt.js";
 import { PythonBridge } from "./python-bridge.js";
 import type {
   AgentCycleResponse,
   BenchmarkConfig,
   BenchmarkSummary,
+  InspectionArtifacts,
   PaperRunResult,
   ToolResult,
 } from "./types.js";
@@ -32,12 +38,8 @@ type RenderPagesResult = ToolResult<{
 }>;
 
 type FigureManifestResult = ToolResult<{
+  figure_pages: number[];
   manifest_path: string;
-}>;
-
-type SampleImagesResult = ToolResult<{
-  selected_images: string[];
-  contact_sheet_path: string | null;
 }>;
 
 type TechnicalResult = ToolResult<{
@@ -154,15 +156,6 @@ export class BenchmarkRunner {
       return failedResult(paper, pdfPath, `Failed to extract paper text: ${extract.error ?? "unknown error"}`, runId, runDir, createRun.run_manifest_path);
     }
 
-    const renderedPages = (await this.bridge.invoke("render_pdf_pages", {
-      pdf_path: pdfPath,
-      run_id: runId,
-      dpi: this.config.pageRenderDpi,
-    })) as RenderPagesResult;
-    if (!renderedPages.ok) {
-      return failedResult(paper, pdfPath, `Failed to render PDF pages: ${renderedPages.error ?? "unknown error"}`, runId, runDir, createRun.run_manifest_path);
-    }
-
     const figureManifest = (await this.bridge.invoke("list_paper_figures", {
       pdf_path: pdfPath,
       run_id: runId,
@@ -184,8 +177,7 @@ export class BenchmarkRunner {
     const thread = this.codex.startThread(threadOptions);
 
     let technicalEvaluationPath: string | null = null;
-    let outputImagePaths: string[] = [];
-    let contactSheetPath: string | null = null;
+    let pageManifestPath: string | null = null;
     let lastSummary: string | undefined;
     let finalCycle: AgentCycleResponse | null = null;
     let status: PaperRunResult["status"] = "max_turns";
@@ -198,21 +190,20 @@ export class BenchmarkRunner {
         runId,
         runDir,
         paperTextPath: extract.text_path,
-        pageManifestPath: renderedPages.manifest_path,
+        pageRenderDpi: this.config.pageRenderDpi,
+        representativeOutputFrames: this.config.representativeOutputFrames,
+        pageManifestPath,
         figureManifestPath: figureManifest.manifest_path,
+        likelyFigurePages: figureManifest.figure_pages,
         cycle,
         previousSummary: lastSummary,
         technicalEvaluationPath,
-        outputImagePaths,
-        contactSheetPath,
+        paperImagePaths: [],
+        outputImagePaths: [],
+        contactSheetPath: null,
       });
 
-      const input = buildTurnInput(
-        prompt,
-        renderedPages.pages.map((page) => page.path),
-        outputImagePaths,
-        contactSheetPath,
-      );
+      const input = buildTurnInput(prompt, [], [], null);
       let turn: CollectedTurn;
       try {
         turn = await collectTurn(thread, input);
@@ -245,6 +236,64 @@ export class BenchmarkRunner {
         );
       }
 
+      let latestInspection = collectInspectionArtifacts(turn.items, runDir);
+      pageManifestPath = latestInspection.pageManifestPath ?? pageManifestPath;
+      const reviewInspection = latestInspection;
+
+      if (hasInspectionArtifacts(reviewInspection)) {
+        const reviewPrompt = buildImageReviewPrompt({
+          paperName: paper,
+          runId,
+          cycle,
+          paperImagePaths: reviewInspection.paperImagePaths,
+          outputImagePaths: reviewInspection.outputImagePaths,
+          contactSheetPath: reviewInspection.contactSheetPath,
+          technicalEvaluationPath,
+        });
+
+        const reviewInput = buildTurnInput(
+          reviewPrompt,
+          reviewInspection.paperImagePaths,
+          reviewInspection.outputImagePaths,
+          reviewInspection.contactSheetPath,
+        );
+        let reviewTurn: CollectedTurn;
+        try {
+          reviewTurn = await collectTurn(thread, reviewInput);
+        } catch (error) {
+          return failedResult(
+            paper,
+            pdfPath,
+            `Failed during image review turn: ${error instanceof Error ? error.message : String(error)}`,
+            runId,
+            runDir,
+            createRun.run_manifest_path,
+            thread.id,
+          );
+        }
+        await writeTranscript(
+          path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`),
+          reviewTurn.events,
+        );
+
+        try {
+          cycleResponse = parseCycleResponse(reviewTurn.finalResponse);
+        } catch (error) {
+          return failedResult(
+            paper,
+            pdfPath,
+            `Codex returned invalid structured output after image review: ${(error as Error).message}`,
+            runId,
+            runDir,
+            createRun.run_manifest_path,
+            thread.id,
+          );
+        }
+
+        latestInspection = collectInspectionArtifacts(reviewTurn.items, runDir);
+        pageManifestPath = latestInspection.pageManifestPath ?? pageManifestPath;
+      }
+
       finalCycle = cycleResponse;
       lastSummary = cycleResponse.summary;
 
@@ -253,16 +302,6 @@ export class BenchmarkRunner {
       })) as TechnicalResult;
       if (technical.ok) {
         technicalEvaluationPath = technical.evaluation_json_path;
-      }
-
-      const sampled = (await this.bridge.invoke("sample_output_images", {
-        run_id: runId,
-        limit: this.config.representativeOutputFrames,
-        create_contact_sheet: true,
-      })) as SampleImagesResult;
-      if (sampled.ok) {
-        outputImagePaths = sampled.selected_images;
-        contactSheetPath = sampled.contact_sheet_path;
       }
 
       if (cycleResponse.status === "completed" && !cycleResponse.needsAnotherImageReview) {
@@ -320,10 +359,10 @@ function buildTurnInput(
   contactSheetPath: string | null,
 ): UserInput[] {
   const inputs: UserInput[] = [{ type: "text", text: prompt }];
-  for (const imagePath of paperImagePaths) {
+  for (const imagePath of uniquePaths(paperImagePaths)) {
     inputs.push({ type: "local_image", path: imagePath });
   }
-  for (const imagePath of outputImagePaths) {
+  for (const imagePath of uniquePaths(outputImagePaths)) {
     inputs.push({ type: "local_image", path: imagePath });
   }
   if (contactSheetPath) {
@@ -404,6 +443,75 @@ function average(values: number[]): number {
     return 0;
   }
   return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2));
+}
+
+function hasInspectionArtifacts(value: InspectionArtifacts): boolean {
+  return (
+    value.paperImagePaths.length > 0 ||
+    value.outputImagePaths.length > 0 ||
+    value.contactSheetPath !== null
+  );
+}
+
+function uniquePaths(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function collectInspectionArtifacts(items: ThreadItem[], runDir: string): InspectionArtifacts {
+  const paperImagePaths = new Set<string>();
+  const outputImagePaths = new Set<string>();
+  let contactSheetPath: string | null = null;
+  let pageManifestPath: string | null = null;
+
+  for (const item of items) {
+    const toolItem = item as any;
+    if (toolItem.type !== "mcp_tool_call" || toolItem.status !== "completed" || !toolItem.result) {
+      continue;
+    }
+
+    const payload =
+      toolItem.result?.structured_content?.result ??
+      toolItem.result?.structuredContent?.result ??
+      null;
+    if (!payload || payload.ok === false) {
+      continue;
+    }
+
+    if (toolItem.tool === "render_pdf_pages" && Array.isArray(payload.pages)) {
+      for (const page of payload.pages) {
+        if (typeof page?.path === "string") {
+          paperImagePaths.add(resolveArtifactPath(runDir, page.path));
+        }
+      }
+      if (typeof payload.manifest_path === "string") {
+        pageManifestPath = resolveArtifactPath(runDir, payload.manifest_path);
+      }
+    }
+
+    if (toolItem.tool === "sample_output_images") {
+      if (Array.isArray(payload.selected_images)) {
+        for (const imagePath of payload.selected_images) {
+          if (typeof imagePath === "string") {
+            outputImagePaths.add(resolveArtifactPath(runDir, imagePath));
+          }
+        }
+      }
+      if (typeof payload.contact_sheet_path === "string" && payload.contact_sheet_path.length > 0) {
+        contactSheetPath = resolveArtifactPath(runDir, payload.contact_sheet_path);
+      }
+    }
+  }
+
+  return {
+    paperImagePaths: [...paperImagePaths],
+    outputImagePaths: [...outputImagePaths],
+    contactSheetPath,
+    pageManifestPath,
+  };
+}
+
+function resolveArtifactPath(runDir: string, value: string): string {
+  return path.isAbsolute(value) ? value : path.join(runDir, value);
 }
 
 async function writeTranscript(outputPath: string, events: ThreadEvent[]): Promise<void> {

@@ -42,6 +42,13 @@ export type AgentCycleResponse = {
   reproduction: ReproductionReport | null;
 };
 
+export type InspectionArtifacts = {
+  paperImagePaths: string[];
+  outputImagePaths: string[];
+  contactSheetPath: string | null;
+  pageManifestPath: string | null;
+};
+
 export type PaperRunResult = {
   paper: string;
   pdfPath: string;

@@ -221,9 +221,9 @@ Important fields:
   Upper bound on the host-controlled review/revision cycles for a single paper.
   One turn is one full Codex cycle for that paper, not one MCP tool call.
 - `pageRenderDpi`
-  Resolution used when staging page images.
+  Preferred resolution used when the agent requests specific paper pages for rendering.
 - `representativeOutputFrames`
-  Number of Morpheus output images sampled back into the next review cycle.
+  Preferred number of Morpheus output images the agent should sample when it asks for visual inspection.
 - `mcpCommand`
   Command used to start the MCP server.
 - `skillPaths`
@@ -249,6 +249,13 @@ The main files to inspect are:
   Morpheus errors and warnings.
 - `benchmark_runs/<run_dir>/transcripts/`
   Per-cycle structured Codex output.
+
+The benchmark is text-first. It does not attach all page images or all Morpheus output images up front. Instead:
+
+- the agent reads `paper.txt` first;
+- if it needs figures, it requests specific pages with `render_pdf_pages`;
+- if it needs Morpheus visual output, it requests sampled images with `sample_output_images`;
+- the runner then provides those images in an immediate follow-up review turn within the same host cycle.
 
 ## 12. Common setup failures
 

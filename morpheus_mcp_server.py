@@ -37,8 +37,11 @@ RUNS_ROOT = Path(os.getenv("MORPHEUS_RUNS_DIR", REPO_ROOT / "runs")).expanduser(
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 MORPHEUS_BIN = os.getenv("MORPHEUS_BIN", "morpheus")
-MAX_TEXT_PREVIEW = 2_000
-MAX_READ_CHARS = 20_000
+MAX_TEXT_PREVIEW = 1_000
+MAX_READ_CHARS = 50_000
+MAX_REFERENCE_READ_CHARS = 250_000
+MAX_LOG_PREVIEW_CHARS = 1_500
+MAX_OUTPUT_PATHS = 6
 
 REFERENCES_ROOT = REPO_ROOT / "references"
 REFERENCE_CATEGORIES = {
@@ -95,6 +98,15 @@ def _read_text(path: Path, max_chars: int = MAX_READ_CHARS) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
 
 
+def _read_text_tail(path: Path, max_chars: int = MAX_LOG_PREVIEW_CHARS) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
 def _merge_manifest(run_id: str, updates: Dict[str, Any]) -> Path:
     manifest_path = _run_dir(run_id) / "run_manifest.json"
     if manifest_path.exists():
@@ -117,6 +129,37 @@ def _list_outputs(run_path: Path) -> Dict[str, List[str]]:
         "xml": sorted(str(path) for path in run_path.rglob("*.xml")),
         "dot": sorted(str(path) for path in run_path.rglob("*.dot")),
         "log": sorted(str(path) for path in run_path.rglob("*.log")),
+    }
+
+
+def _relative_to_run(run_path: Path, target: Path) -> str:
+    try:
+        return str(target.resolve().relative_to(run_path.resolve()))
+    except Exception:
+        return str(target)
+
+
+def _sample_paths(run_path: Path, paths: Sequence[str], limit: int = MAX_OUTPUT_PATHS) -> List[str]:
+    sampled = [Path(path) for path in paths[:limit]]
+    return [_relative_to_run(run_path, path) for path in sampled]
+
+
+def _last_relative(run_path: Path, paths: Sequence[str]) -> Optional[str]:
+    if not paths:
+        return None
+    return _relative_to_run(run_path, Path(paths[-1]))
+
+
+def _output_counts(outputs: Dict[str, List[str]]) -> Dict[str, int]:
+    return {key: len(value) for key, value in outputs.items()}
+
+
+def _time_progress_summary(stdout_text: str) -> Dict[str, Any]:
+    time_lines, time_values = _count_time_lines(stdout_text)
+    return {
+        "time_lines_count": time_lines,
+        "first_time_value": time_values[0] if time_values else None,
+        "last_time_value": time_values[-1] if time_values else None,
     }
 
 
@@ -411,7 +454,7 @@ def _validate_xml_completeness(xml: str) -> Dict[str, Any]:
 
 def _extract_stop_time(xml_text: str) -> Optional[float]:
     patterns = [
-        r'<StopTime\s+value\s*=\s*["\']?([\d.eE+-]+)["\']?\s*/?>',
+        r'<StopTime\b[^>]*\bvalue\s*=\s*["\']?([\d.eE+-]+)["\']?[^>]*/?>',
         r'<StopTime[^>]*>([\d.eE+-]+)</StopTime>',
     ]
     for pattern in patterns:
@@ -631,7 +674,7 @@ def render_pdf_pages(
         return {"ok": False, "error": str(exc)}
 
     page_entries = [
-        {"page": page, "path": str(path)}
+        {"page": page, "path": _relative_to_run(run_path, path)}
         for page, path in zip(selected_pages, rendered_paths)
     ]
     manifest_path = run_path / "paper_page_manifest.json"
@@ -658,7 +701,7 @@ def render_pdf_pages(
         "pdf_path": str(pdf_file),
         "dpi": dpi,
         "pages": page_entries,
-        "manifest_path": str(manifest_path),
+        "manifest_path": _relative_to_run(run_path, manifest_path),
     }
 
 
@@ -673,13 +716,15 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
     run_path = _run_dir(run_id)
 
     figures = _list_pdf_figures(pdf_file)
+    figure_pages = sorted({figure["page"] for figure in figures if isinstance(figure.get("page"), int)})
     manifest_path = run_path / "paper_figure_manifest.json"
     _write_json(
         manifest_path,
         {
             "pdf_path": str(pdf_file),
             "generated_at": _now_iso(),
-            "figures": figures,
+            "figure_count": len(figures),
+            "figure_pages": figure_pages,
         },
     )
     _merge_manifest(
@@ -695,12 +740,9 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
         "run_id": run_id,
         "pdf_path": str(pdf_file),
         "figure_count": len(figures),
-        "figures": figures,
-        "manifest_path": str(manifest_path),
-        "note": (
-            "This is a PDF image-object manifest. Use rendered page images for multimodal inspection "
-            "instead of assuming every embedded object is a meaningful figure."
-        ),
+        "figure_pages": figure_pages,
+        "manifest_path": _relative_to_run(run_path, manifest_path),
+        "note": "Likely pages containing figures. Render only specific pages when visual inspection is needed.",
     }
 
 
@@ -720,7 +762,7 @@ def list_references(category: Optional[str] = None) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def read_reference(category: str, name: str, max_chars: int = MAX_READ_CHARS) -> Dict[str, Any]:
+def read_reference(category: str, name: str, max_chars: int = MAX_REFERENCE_READ_CHARS) -> Dict[str, Any]:
     directory = REFERENCE_CATEGORIES.get(category)
     if not directory:
         return {
@@ -822,10 +864,9 @@ def run_morpheus_model(
         return {
             "ok": False,
             "error": f"Morpheus binary not found: {MORPHEUS_BIN}",
-            "command": command,
         }
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "command": command}
+        return {"ok": False, "error": str(exc)}
 
     stdout_path = run_path / "stdout.log"
     stderr_path = run_path / "stderr.log"
@@ -835,6 +876,7 @@ def run_morpheus_model(
     outputs = _list_outputs(run_path)
     primary_pngs = [path for path in outputs["png"] if Path(path).name.startswith("plot_")]
     logger_pngs = [path for path in outputs["png"] if Path(path).name.startswith("logger_")]
+    stdout_summary = _time_progress_summary(result["stdout"])
     manifest_path = _merge_manifest(
         run_id,
         {
@@ -852,20 +894,25 @@ def run_morpheus_model(
     return {
         "ok": ok,
         "run_id": run_id,
-        "xml_path": str(xml_file),
+        "xml_path": _relative_to_run(run_path, xml_file),
         "run_dir": str(run_path),
-        "command": command,
         "returncode": result["returncode"],
-        "stdout": result["stdout"][:MAX_READ_CHARS],
-        "stderr": result["stderr"][:MAX_READ_CHARS],
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "outputs": outputs,
-        "png_count": len(outputs["png"]),
-        "csv_count": len(outputs["csv"]),
-        "primary_plot_count": len(primary_pngs),
-        "logger_plot_count": len(logger_pngs),
-        "run_manifest_path": str(manifest_path),
+        "stdout_path": _relative_to_run(run_path, stdout_path),
+        "stderr_path": _relative_to_run(run_path, stderr_path),
+        "stdout_tail": _read_text_tail(stdout_path),
+        "stderr_tail": _read_text_tail(stderr_path),
+        "time_progress": stdout_summary,
+        "output_counts": {
+            **_output_counts(outputs),
+            "primary_plot_count": len(primary_pngs),
+            "logger_plot_count": len(logger_pngs),
+        },
+        "key_outputs": {
+            "latest_primary_plot": _last_relative(run_path, primary_pngs),
+            "latest_logger_plot": _last_relative(run_path, logger_pngs),
+            "latest_csv": _last_relative(run_path, outputs["csv"]),
+        },
+        "run_manifest_path": _relative_to_run(run_path, manifest_path),
         "message": "Morpheus run completed" if ok else "Morpheus run failed",
     }
 
@@ -877,20 +924,32 @@ def summarize_morpheus_run(run_id: str) -> Dict[str, Any]:
     stdout_path = run_path / "stdout.log"
     stderr_path = run_path / "stderr.log"
     xml_path = run_path / "model.xml"
+    primary_pngs = [path for path in outputs["png"] if Path(path).name.startswith("plot_")]
+    logger_pngs = [path for path in outputs["png"] if Path(path).name.startswith("logger_")]
+    stdout_text = _read_text_tail(stdout_path) if stdout_path.exists() else ""
+    stderr_text = _read_text_tail(stderr_path) if stderr_path.exists() else ""
 
     return {
         "ok": True,
         "run_id": run_id,
         "run_dir": str(run_path),
-        "outputs": outputs,
-        "png_count": len(outputs["png"]),
-        "csv_count": len(outputs["csv"]),
-        "xml_count": len(outputs["xml"]),
-        "stdout_path": str(stdout_path) if stdout_path.exists() else None,
-        "stderr_path": str(stderr_path) if stderr_path.exists() else None,
-        "stdout_preview": _read_text(stdout_path) if stdout_path.exists() else "",
-        "stderr_preview": _read_text(stderr_path) if stderr_path.exists() else "",
-        "xml_path": str(xml_path) if xml_path.exists() else None,
+        "xml_path": _relative_to_run(run_path, xml_path) if xml_path.exists() else None,
+        "stdout_path": _relative_to_run(run_path, stdout_path) if stdout_path.exists() else None,
+        "stderr_path": _relative_to_run(run_path, stderr_path) if stderr_path.exists() else None,
+        "output_counts": {
+            **_output_counts(outputs),
+            "primary_plot_count": len(primary_pngs),
+            "logger_plot_count": len(logger_pngs),
+        },
+        "key_outputs": {
+            "latest_primary_plot": _last_relative(run_path, primary_pngs),
+            "latest_logger_plot": _last_relative(run_path, logger_pngs),
+            "latest_csv": _last_relative(run_path, outputs["csv"]),
+            "sample_output_paths": _sample_paths(run_path, outputs["png"]),
+        },
+        "time_progress": _time_progress_summary(stdout_text),
+        "stdout_tail": stdout_text,
+        "stderr_tail": stderr_text,
     }
 
 
@@ -902,14 +961,14 @@ def sample_output_images(
 ) -> Dict[str, Any]:
     run_path = _run_dir(run_id)
     sample = _sample_run_images(run_path, limit)
-    selected_paths = [str(path) for path in sample["selected"]]
+    selected_paths = [_relative_to_run(run_path, path) for path in sample["selected"]]
     contact_sheet_path: Optional[str] = None
 
     if create_contact_sheet and sample["selected"]:
         output_path = run_path / "sample_contact_sheet.png"
         created = _create_contact_sheet(sample["selected"], output_path)
         if created:
-            contact_sheet_path = str(created)
+            contact_sheet_path = _relative_to_run(run_path, created)
 
     return {
         "ok": True,

@@ -1,26 +1,52 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildCyclePrompt, parseCycleResponse } from "../src/benchmark/prompt.js";
+import {
+  buildCyclePrompt,
+  buildImageReviewPrompt,
+  parseCycleResponse,
+} from "../src/benchmark/prompt.js";
 
-test("buildCyclePrompt includes staged artifact paths", () => {
+test("buildCyclePrompt prefers on-demand image inspection", () => {
   const prompt = buildCyclePrompt({
     paperName: "1_Szabo2010_clean.pdf",
     pdfPath: "benchmark_papers/1_Szabo2010_clean.pdf",
     runId: "run_123",
     runDir: "benchmark_runs/run_123",
     paperTextPath: "benchmark_runs/run_123/paper.txt",
+    pageRenderDpi: 150,
+    representativeOutputFrames: 5,
     pageManifestPath: "benchmark_runs/run_123/paper_page_manifest.json",
     figureManifestPath: "benchmark_runs/run_123/paper_figure_manifest.json",
+    likelyFigurePages: [2, 4],
     cycle: 2,
     previousSummary: "Initial run complete",
     technicalEvaluationPath: "benchmark_runs/run_123/technical_evaluation.json",
+    paperImagePaths: [],
     outputImagePaths: ["benchmark_runs/run_123/plot_00000.png"],
     contactSheetPath: "benchmark_runs/run_123/sample_contact_sheet.png",
   });
 
   assert.match(prompt, /Run ID: run_123/);
   assert.match(prompt, /technical_evaluation\.json/);
+  assert.match(prompt, /plot_00000\.png/);
+  assert.match(prompt, /Likely figure pages: 2, 4/);
+  assert.match(prompt, /render only the specific pages/i);
+});
+
+test("buildImageReviewPrompt lists attached review images", () => {
+  const prompt = buildImageReviewPrompt({
+    paperName: "1_Szabo2010_clean.pdf",
+    runId: "run_123",
+    cycle: 2,
+    paperImagePaths: ["benchmark_runs/run_123/paper_pages/page_0002.png"],
+    outputImagePaths: ["benchmark_runs/run_123/plot_00000.png"],
+    contactSheetPath: "benchmark_runs/run_123/sample_contact_sheet.png",
+    technicalEvaluationPath: "benchmark_runs/run_123/technical_evaluation.json",
+  });
+
+  assert.match(prompt, /Image review follow-up/);
+  assert.match(prompt, /page_0002\.png/);
   assert.match(prompt, /plot_00000\.png/);
 });
 
