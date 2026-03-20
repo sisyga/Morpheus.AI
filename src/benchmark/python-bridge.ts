@@ -22,10 +22,12 @@ type PythonToolName =
 export class PythonBridge {
   private readonly pythonExecutable: string;
   private readonly cliPath: string;
+  private readonly runsDir: string | undefined;
 
   constructor() {
     this.pythonExecutable = process.env.PYTHON_EXECUTABLE ?? "python";
     this.cliPath = path.resolve(process.cwd(), "morpheus_tools_cli.py");
+    this.runsDir = process.env.MORPHEUS_RUNS_DIR;
   }
 
   invoke<T extends Record<string, unknown>>(command: PythonToolName, payload: Record<string, unknown>): Promise<ToolResult<T>> {
@@ -33,6 +35,10 @@ export class PythonBridge {
       const child = spawn(this.pythonExecutable, [this.cliPath, command], {
         cwd: process.cwd(),
         stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...(this.runsDir ? { MORPHEUS_RUNS_DIR: this.runsDir } : {}),
+        },
       });
 
       let stdout = "";

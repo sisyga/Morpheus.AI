@@ -56,12 +56,14 @@ type CollectedTurn = {
 };
 
 export class BenchmarkRunner {
-  private readonly bridge = new PythonBridge();
+  private readonly bridge: PythonBridge;
   private readonly codex: Codex;
   private readonly config: BenchmarkConfig;
 
   constructor(config: BenchmarkConfig) {
     this.config = config;
+    process.env.MORPHEUS_RUNS_DIR = config.resultsDir;
+    this.bridge = new PythonBridge();
     this.codex = new Codex({
       config: {
         mcp_servers: {
@@ -304,7 +306,11 @@ export class BenchmarkRunner {
         technicalEvaluationPath = technical.evaluation_json_path;
       }
 
-      if (cycleResponse.status === "completed" && !cycleResponse.needsAnotherImageReview) {
+      if (
+        cycleResponse.status === "completed" &&
+        !cycleResponse.needsAnotherCycle &&
+        !cycleResponse.needsAnotherImageReview
+      ) {
         status = "completed";
         break;
       }
@@ -321,9 +327,8 @@ export class BenchmarkRunner {
     const technicalScore = technical.ok ? technical.total_score : null;
     const technicalPath = technical.ok ? technical.evaluation_json_path : technicalEvaluationPath;
 
-    const reproductionPath = path.join(runDir, "reproduction_report.json");
     const reproductionScore = finalCycle?.reproduction?.total_score ?? null;
-    await writeJson(reproductionPath, {
+    const reproductionPayload = {
       paper,
       pdfPath,
       runId,
@@ -331,7 +336,21 @@ export class BenchmarkRunner {
       status,
       reproduction: finalCycle?.reproduction ?? null,
       summary: finalCycle?.summary ?? "",
-    });
+      technicalScore,
+      technicalEvaluationPath: technicalPath ?? null,
+      cycles: completedCycles,
+    };
+    const primaryReportDir = technicalPath ? path.dirname(technicalPath) : runDir;
+    const reportDirectories = uniquePaths([primaryReportDir, runDir]);
+    for (const reportDir of reportDirectories) {
+      await writeJson(path.join(reportDir, "reproduction_report.json"), reproductionPayload);
+      await writeText(
+        path.join(reportDir, "reproduction_report.txt"),
+        formatReproductionReportText(reproductionPayload),
+      );
+    }
+    const reproductionPath = path.join(primaryReportDir, "reproduction_report.json");
+    const reproductionTextPath = path.join(primaryReportDir, "reproduction_report.txt");
 
     const result: PaperRunResult = {
       paper,
@@ -344,6 +363,7 @@ export class BenchmarkRunner {
       reproductionScore,
       technicalEvaluationPath: technicalPath ?? null,
       reproductionReportPath: reproductionPath,
+      reproductionReportTextPath: reproductionTextPath,
       runManifestPath: createRun.run_manifest_path,
       summary: finalCycle?.summary ?? "No final summary available.",
       error: status === "failed" ? finalCycle?.summary : undefined,
@@ -522,6 +542,77 @@ async function writeJson(outputPath: string, payload: unknown): Promise<void> {
   await writeFile(outputPath, JSON.stringify(payload, null, 2), "utf8");
 }
 
+async function writeText(outputPath: string, content: string): Promise<void> {
+  await mkdir(path.dirname(outputPath), { recursive: true });
+  await writeFile(outputPath, content, "utf8");
+}
+
+function formatReproductionReportText(payload: {
+  paper: string;
+  pdfPath: string;
+  runId: string;
+  generatedAt: string;
+  status: PaperRunResult["status"];
+  reproduction: AgentCycleResponse["reproduction"];
+  summary: string;
+  technicalScore: number | null;
+  technicalEvaluationPath: string | null;
+  cycles: number;
+}): string {
+  const lines = [
+    "============================================================",
+    "MORPHEUS REPRODUCTION REPORT",
+    "============================================================",
+    `Paper: ${payload.paper}`,
+    `PDF Path: ${payload.pdfPath}`,
+    `Run ID: ${payload.runId}`,
+    `Timestamp: ${payload.generatedAt}`,
+    `Status: ${payload.status}`,
+    `Cycles: ${payload.cycles}`,
+    `Technical Score: ${payload.technicalScore ?? "n/a"}`,
+    `Technical Evaluation: ${payload.technicalEvaluationPath ?? "n/a"}`,
+    "",
+    `SUMMARY: ${payload.summary || "No summary available."}`,
+  ];
+
+  if (!payload.reproduction) {
+    lines.push("", "No reproduction rubric was returned.");
+    return lines.join("\n");
+  }
+
+  lines.push(
+    "",
+    `TOTAL REPRODUCTION SCORE: ${payload.reproduction.total_score} / 8`,
+    `REPRODUCTION SUMMARY: ${payload.reproduction.summary}`,
+  );
+
+  type ReproductionCriterionKey =
+    | "source_coverage"
+    | "mechanism_mapping"
+    | "observable_alignment"
+    | "parameter_plausibility";
+  const sections: Array<[string, ReproductionCriterionKey]> = [
+    ["Source Coverage", "source_coverage"],
+    ["Mechanism Mapping", "mechanism_mapping"],
+    ["Observable Alignment", "observable_alignment"],
+    ["Parameter Plausibility", "parameter_plausibility"],
+  ];
+
+  for (const [title, key] of sections) {
+    const criterion = payload.reproduction[key];
+    lines.push("", `${title}: ${criterion.score} / 2`, `Rationale: ${criterion.rationale}`, "Evidence:");
+    if (criterion.evidence.length === 0) {
+      lines.push("- None provided");
+      continue;
+    }
+    for (const evidence of criterion.evidence) {
+      lines.push(`- ${evidence}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function failedResult(
   paper: string,
   pdfPath: string,
@@ -542,6 +633,7 @@ function failedResult(
     reproductionScore: null,
     technicalEvaluationPath: null,
     reproductionReportPath: null,
+    reproductionReportTextPath: null,
     runManifestPath,
     summary: error,
     error,

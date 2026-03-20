@@ -38,6 +38,7 @@ export type AgentCycleResponse = {
   summary: string;
   modelChanged: boolean;
   morpheusRan: boolean;
+  needsAnotherCycle: boolean;
   needsAnotherImageReview: boolean;
   reproduction: ReproductionReport | null;
 };
@@ -60,6 +61,7 @@ export type PaperRunResult = {
   reproductionScore: number | null;
   technicalEvaluationPath: string | null;
   reproductionReportPath: string | null;
+  reproductionReportTextPath: string | null;
   runManifestPath: string | null;
   summary: string;
   error?: string;

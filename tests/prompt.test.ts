@@ -58,6 +58,7 @@ test("parseCycleResponse accepts a valid structured response", () => {
       summary: "Completed successfully.",
       modelChanged: false,
       morpheusRan: true,
+      needsAnotherCycle: false,
       needsAnotherImageReview: false,
       reproduction: {
         source_coverage: { score: 2, evidence: ["paper page 1"], rationale: "Used paper text and figures." },
@@ -72,4 +73,29 @@ test("parseCycleResponse accepts a valid structured response", () => {
 
   assert.equal(parsed.status, "completed");
   assert.equal(parsed.reproduction?.total_score, 6);
+  assert.equal(parsed.needsAnotherCycle, false);
+});
+
+test("buildCyclePrompt distinguishes another cycle from image review", () => {
+  const prompt = buildCyclePrompt({
+    paperName: "1_Szabo2010_clean.pdf",
+    pdfPath: "benchmark_papers/1_Szabo2010_clean.pdf",
+    runId: "run_123",
+    runDir: "benchmark_runs/run_123",
+    paperTextPath: "benchmark_runs/run_123/paper.txt",
+    pageRenderDpi: 150,
+    representativeOutputFrames: 5,
+    pageManifestPath: null,
+    figureManifestPath: null,
+    likelyFigurePages: [],
+    cycle: 1,
+    previousSummary: undefined,
+    technicalEvaluationPath: null,
+    paperImagePaths: [],
+    outputImagePaths: [],
+    contactSheetPath: null,
+  });
+
+  assert.match(prompt, /needsAnotherCycle=true/i);
+  assert.match(prompt, /needsAnotherImageReview=true/i);
 });

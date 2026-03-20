@@ -11,6 +11,7 @@ export const FINAL_RESPONSE_SCHEMA = {
     summary: { type: "string" },
     modelChanged: { type: "boolean" },
     morpheusRan: { type: "boolean" },
+    needsAnotherCycle: { type: "boolean" },
     needsAnotherImageReview: { type: "boolean" },
     reproduction: {
       type: ["object", "null"],
@@ -39,6 +40,7 @@ export const FINAL_RESPONSE_SCHEMA = {
     "summary",
     "modelChanged",
     "morpheusRan",
+    "needsAnotherCycle",
     "needsAnotherImageReview",
     "reproduction",
   ],
@@ -178,8 +180,8 @@ export function buildCyclePrompt(params: PromptParams): string {
 
   const completenessBlock = [
     "<completeness_contract>",
-    "- Treat the task as incomplete until: a model runs, technical evaluation passes, and the reproduction rubric is filled.",
-    "- status=completed only when both technical_evaluation_path and a filled reproduction rubric with cited evidence exist.",
+    "- Treat the task as incomplete until: a model runs, technical evaluation passes, the reproduction rubric is filled, and you have judged whether another full benchmark cycle is still needed.",
+    "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, and needsAnotherCycle=false.",
     "- If Morpheus fails and cannot be recovered, set status=failed; reproduction may be null.",
     "</completeness_contract>",
   ].join("\n");
@@ -190,7 +192,9 @@ export function buildCyclePrompt(params: PromptParams): string {
     "- Confirm model.xml exists and ran without fatal errors.",
     "- Confirm technical_evaluation_path exists.",
     "- Confirm the reproduction rubric is fully filled with paper section/figure and output file citations.",
-    "- If any of these are missing, set status=in_progress and state what remains.",
+    "- If reproduction is still only partial but you have a concrete next revision, rerun, or evidence-gathering step that could materially improve it, set status=in_progress and needsAnotherCycle=true.",
+    "- Reserve status=completed for a finished attempt, even if the reproduction score is imperfect.",
+    "- If any required artifact is missing, set status=in_progress and state what remains.",
     "</verification_loop>",
   ].join("\n");
 
@@ -198,7 +202,8 @@ export function buildCyclePrompt(params: PromptParams): string {
     "<output_contract>",
     "- Return exactly the JSON schema provided. No prose, no markdown fences.",
     "- reproduction evidence strings must cite specific paper pages/figures and output files by name.",
-    "- Set needsAnotherImageReview=true only if you genuinely need another host cycle after this one.",
+    "- Set needsAnotherCycle=true only if you need another full benchmark cycle after this response.",
+    "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection.",
     "</output_contract>",
   ].join("\n");
 
@@ -234,7 +239,8 @@ export function buildImageReviewPrompt(params: ImageReviewPromptParams): string 
     "Inspect them directly before deciding whether the model is a plausible reproduction.",
     "Do not reread SKILL.md through a file tool.",
     "Only rerun Morpheus if the images clearly show that the current model is wrong.",
-    "If you rerun and still need another host cycle after this review turn, set needsAnotherImageReview=true.",
+    "If you still need another benchmark cycle after this review turn, set needsAnotherCycle=true.",
+    "Set needsAnotherImageReview=true only if that next cycle specifically needs more image inspection.",
     params.paperImagePaths.length > 0 ? `Attached paper image paths: ${params.paperImagePaths.join(", ")}` : "",
     params.outputImagePaths.length > 0 ? `Attached output image paths: ${params.outputImagePaths.join(", ")}` : "",
     params.contactSheetPath ? `Attached contact sheet path: ${params.contactSheetPath}` : "",
