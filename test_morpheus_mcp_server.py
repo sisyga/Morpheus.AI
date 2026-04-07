@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import tempfile
+import shutil
 import unittest
+import uuid
+from unittest import mock
 from pathlib import Path
 
 import morpheus_mcp_server as server
@@ -9,10 +11,15 @@ import morpheus_mcp_server as server
 
 class MorpheusMcpServerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tempdir.cleanup)
-        server.RUNS_ROOT = Path(self.tempdir.name)
+        temp_root = Path.cwd() / "runs" / "unit_tests"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        server.RUNS_ROOT = temp_root / f"test_{uuid.uuid4().hex}"
         server.RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(server.RUNS_ROOT, ignore_errors=True))
+        self.env_patch = mock.patch.dict("os.environ", {}, clear=False)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        server.os.environ.pop(server.ACTIVE_RUN_ID_ENV, None)
 
     def test_write_model_xml_creates_versioned_copies(self) -> None:
         result = server.write_model_xml(
@@ -54,6 +61,34 @@ class MorpheusMcpServerTests(unittest.TestCase):
         </MorpheusModel>
         """
         self.assertEqual(server._extract_stop_time(xml), 40.0)
+
+    def test_validation_accepts_single_quoted_png_terminal(self) -> None:
+        validation = server._validate_xml_completeness(
+            """
+            <MorpheusModel version='4'>
+              <Description><Title>Eval</Title></Description>
+              <Space></Space>
+              <Time></Time>
+              <Analysis><Gnuplotter><Terminal name='png'/></Gnuplotter></Analysis>
+            </MorpheusModel>
+            """
+        )
+        self.assertTrue(validation["has_gnuplotter"])
+
+    def test_create_run_reuses_existing_run_id_name(self) -> None:
+        existing = server._run_dir("20260402_201012_ten_Berkhout2025_clean")
+        result = server.create_run("20260402_201012_ten_Berkhout2025_clean")
+        self.assertTrue(result["ok"])
+        self.assertEqual(Path(result["run_dir"]), existing)
+        self.assertEqual(result["run_id"], "20260402_201012_ten_Berkhout2025_clean")
+
+    def test_active_run_forces_create_run_to_noop(self) -> None:
+        server.os.environ[server.ACTIVE_RUN_ID_ENV] = "active_run"
+        result = server.create_run("some_other_name")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "active_run")
+        self.assertTrue((server.RUNS_ROOT / "active_run").exists())
+        self.assertFalse((server.RUNS_ROOT / "some_other_name").exists())
 
     def test_evaluate_technical_run_preserves_legacy_score(self) -> None:
         run_path = server._run_dir("run_eval")

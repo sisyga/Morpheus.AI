@@ -52,7 +52,10 @@ def main() -> int:
 
     raw_payload = sys.stdin.read().strip()
     payload = json.loads(raw_payload) if raw_payload else {}
-    result = COMMANDS[sys.argv[1]](**payload)
+    try:
+        result = COMMANDS[sys.argv[1]](**payload)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
     print(json.dumps(result))
     return 0 if result.get("ok", True) else 1
 

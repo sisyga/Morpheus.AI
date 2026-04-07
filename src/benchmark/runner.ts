@@ -44,6 +44,7 @@ type FigureManifestResult = ToolResult<{
 
 type TechnicalResult = ToolResult<{
   total_score: number;
+  max_possible_score?: number;
   evaluation_json_path: string;
 }>;
 
@@ -57,26 +58,29 @@ type CollectedTurn = {
 
 export class BenchmarkRunner {
   private readonly bridge: PythonBridge;
-  private readonly codex: Codex;
   private readonly config: BenchmarkConfig;
 
   constructor(config: BenchmarkConfig) {
     this.config = config;
     process.env.MORPHEUS_RUNS_DIR = config.resultsDir;
     this.bridge = new PythonBridge();
-    this.codex = new Codex({
+  }
+
+  private createCodex(activeRunId?: string): Codex {
+    return new Codex({
       config: {
         mcp_servers: {
           morpheus: {
-            command: config.mcpCommand[0],
-            args: config.mcpCommand.slice(1),
+            command: this.config.mcpCommand[0],
+            args: this.config.mcpCommand.slice(1),
             env: {
-              MORPHEUS_RUNS_DIR: config.resultsDir,
+              MORPHEUS_RUNS_DIR: this.config.resultsDir,
+              ...(activeRunId ? { MORPHEUS_ACTIVE_RUN_ID: activeRunId } : {}),
             },
           },
         },
         skills: {
-          config: config.skillPaths.map((skillPath) => ({ path: skillPath, enabled: true })),
+          config: this.config.skillPaths.map((skillPath) => ({ path: skillPath, enabled: true })),
         },
       },
     });
@@ -150,6 +154,7 @@ export class BenchmarkRunner {
     const runId = createRun.run_id;
     const runDir = createRun.run_dir;
     await mkdir(path.join(runDir, "transcripts"), { recursive: true });
+    const codex = this.createCodex(runId);
 
     const extract = (await this.bridge.invoke("extract_paper_text", {
       pdf_path: pdfPath,
@@ -177,7 +182,7 @@ export class BenchmarkRunner {
       networkAccessEnabled: false,
       webSearchMode: "disabled",
     };
-    const thread = this.codex.startThread(threadOptions);
+    const thread = codex.startThread(threadOptions);
 
     let technicalEvaluationPath: string | null = null;
     let pageManifestPath: string | null = null;
@@ -186,6 +191,7 @@ export class BenchmarkRunner {
     let finalCycle: AgentCycleResponse | null = null;
     let status: PaperRunResult["status"] = "max_turns";
     let completedCycles = 0;
+    let hostContinuationReason: string | undefined;
 
     for (let cycle = 1; cycle <= this.config.maxTurnsPerPaper; cycle += 1) {
       const prompt = buildCyclePrompt({
@@ -202,6 +208,7 @@ export class BenchmarkRunner {
         cycle,
         previousSummary: lastSummary,
         previousReproductionScore: lastReproductionScore,
+        hostContinuationReason,
         technicalEvaluationPath,
         paperImagePaths: [],
         outputImagePaths: [],
@@ -304,6 +311,19 @@ export class BenchmarkRunner {
       })) as TechnicalResult;
       if (technical.ok) {
         technicalEvaluationPath = technical.evaluation_json_path;
+      }
+
+      const continuation = decideContinuation({
+        cycleResponse,
+        technical,
+        cycle,
+        maxCycles: this.config.maxTurnsPerPaper,
+      });
+      hostContinuationReason = continuation.reason ?? undefined;
+
+      if (continuation.shouldContinue) {
+        status = "max_turns";
+        continue;
       }
 
       if (
@@ -470,6 +490,80 @@ function hasInspectionArtifacts(value: InspectionArtifacts): boolean {
     value.paperImagePaths.length > 0 ||
     value.outputImagePaths.length > 0 ||
     value.contactSheetPath !== null
+  );
+}
+
+type ContinuationDecision = {
+  shouldContinue: boolean;
+  reason: string | null;
+};
+
+export function decideContinuation(params: {
+  cycleResponse: AgentCycleResponse;
+  technical: TechnicalResult;
+  cycle: number;
+  maxCycles: number;
+}): ContinuationDecision {
+  if (params.cycle >= params.maxCycles || params.cycleResponse.status === "failed") {
+    return { shouldContinue: false, reason: null };
+  }
+
+  if (params.cycleResponse.needsAnotherCycle) {
+    return { shouldContinue: true, reason: "The agent requested another benchmark cycle." };
+  }
+
+  if (params.cycleResponse.needsAnotherImageReview) {
+    return { shouldContinue: true, reason: "The agent requested another image-review cycle." };
+  }
+
+  if (params.cycleResponse.status !== "completed") {
+    return {
+      shouldContinue: true,
+      reason: `The agent returned status=${params.cycleResponse.status}.`,
+    };
+  }
+
+  if (!params.cycleResponse.morpheusRan) {
+    return { shouldContinue: true, reason: "Morpheus has not run successfully in the agent response." };
+  }
+
+  const reproduction = params.cycleResponse.reproduction;
+  if (!reproduction) {
+    return { shouldContinue: true, reason: "The reproduction rubric is missing." };
+  }
+
+  if (!isFlawlessReproduction(reproduction)) {
+    return {
+      shouldContinue: true,
+      reason: `The reproduction rubric is ${reproduction.total_score}/8; continue until all criteria are 2/2.`,
+    };
+  }
+
+  if (!params.technical.ok) {
+    return {
+      shouldContinue: true,
+      reason: `The host technical evaluation failed: ${params.technical.error ?? "unknown error"}.`,
+    };
+  }
+
+  const maxTechnicalScore = params.technical.max_possible_score ?? 7;
+  if (params.technical.total_score < maxTechnicalScore) {
+    return {
+      shouldContinue: true,
+      reason: `The technical score is ${params.technical.total_score}/${maxTechnicalScore}; continue until it reaches the maximum.`,
+    };
+  }
+
+  return { shouldContinue: false, reason: null };
+}
+
+function isFlawlessReproduction(reproduction: NonNullable<AgentCycleResponse["reproduction"]>): boolean {
+  return (
+    reproduction.total_score >= 8 &&
+    reproduction.source_coverage.score === 2 &&
+    reproduction.mechanism_mapping.score === 2 &&
+    reproduction.observable_alignment.score === 2 &&
+    reproduction.parameter_plausibility.score === 2
   );
 }
 

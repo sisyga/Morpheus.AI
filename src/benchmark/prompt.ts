@@ -77,6 +77,7 @@ type PromptParams = {
   cycle: number;
   previousSummary?: string;
   previousReproductionScore?: number | null;
+  hostContinuationReason?: string;
   technicalEvaluationPath?: string | null;
   paperImagePaths: string[];
   outputImagePaths: string[];
@@ -145,6 +146,11 @@ export function buildCyclePrompt(params: PromptParams): string {
       `Continuing from cycle ${params.cycle - 1}. All rules, tool-persistence rules, dependency checks, completeness contract, and verification loop from cycle 1 remain in effect.`,
       params.previousSummary ? `Previous summary: ${params.previousSummary}` : null,
       `Previous reproduction score: ${reproScore}`,
+      params.hostContinuationReason
+        ? `Host continuation reason: ${params.hostContinuationReason}`
+        : null,
+      `Continue improving the existing model in run_id=${params.runId}; do not call create_run or write outside ${params.runDir}.`,
+      "Completion now requires a flawless reproduction rubric (8/8, every criterion 2/2) and max technical score, or no remaining host cycles.",
       "</cycle_continuation>",
     ]
       .filter((l): l is string => l !== null)
@@ -157,6 +163,9 @@ export function buildCyclePrompt(params: PromptParams): string {
     "<tool_persistence_rules>",
     "- Use the Morpheus skill as the source of modeling behavior. Do not read SKILL.md through a file tool; the skill is already loaded.",
     "- Use MCP tools for references, XML writing, Morpheus execution, run summaries, output sampling, and technical evaluation. Do not edit repository source files.",
+    `- Do not call create_run. The host already created run_id=${params.runId} at ${params.runDir}.`,
+    `- Always pass run_id="${params.runId}" to write_model_xml, run_morpheus_model, summarize_morpheus_run, sample_output_images, render_pdf_pages, and evaluate_technical_run.`,
+    '- Always write the canonical model as file_name="model.xml"; do not create paper-specific subfolders.',
     "- Do not stop early; keep calling tools until a valid model runs and technical evaluation passes.",
     "- If a tool returns an error, diagnose from the error message and retry with a corrected input.",
     "- Preserve executability first, then use paper images and output images to judge reproduction quality.",
@@ -181,7 +190,7 @@ export function buildCyclePrompt(params: PromptParams): string {
   const completenessBlock = [
     "<completeness_contract>",
     "- Treat the task as incomplete until: a model runs, technical evaluation passes, the reproduction rubric is filled, and you have judged whether another full benchmark cycle is still needed.",
-    "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, and needsAnotherCycle=false.",
+    "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, every reproduction criterion is 2/2, total_score is 8/8, technical evaluation is max score, and needsAnotherCycle=false.",
     "- If Morpheus fails and cannot be recovered, set status=failed; reproduction may be null.",
     "</completeness_contract>",
   ].join("\n");
@@ -192,8 +201,8 @@ export function buildCyclePrompt(params: PromptParams): string {
     "- Confirm model.xml exists and ran without fatal errors.",
     "- Confirm technical_evaluation_path exists.",
     "- Confirm the reproduction rubric is fully filled with paper section/figure and output file citations.",
-    "- If reproduction is still only partial but you have a concrete next revision, rerun, or evidence-gathering step that could materially improve it, set status=in_progress and needsAnotherCycle=true.",
-    "- Reserve status=completed for a finished attempt, even if the reproduction score is imperfect.",
+    "- If reproduction is still partial, coarse, heuristic, missing a cited mechanism, missing a paper observable, or below 8/8, set status=in_progress and needsAnotherCycle=true.",
+    "- Reserve status=completed only for a technically maxed, biologically flawless reproduction; imperfect reproductions should keep iterating until the host turn budget runs out.",
     "- If any required artifact is missing, set status=in_progress and state what remains.",
     "</verification_loop>",
   ].join("\n");
@@ -202,7 +211,7 @@ export function buildCyclePrompt(params: PromptParams): string {
     "<output_contract>",
     "- Return exactly the JSON schema provided. No prose, no markdown fences.",
     "- reproduction evidence strings must cite specific paper pages/figures and output files by name.",
-    "- Set needsAnotherCycle=true only if you need another full benchmark cycle after this response.",
+    "- Set needsAnotherCycle=true if reproduction is below 8/8, technical evaluation is below max score, or you identified a concrete weakness that another cycle could improve.",
     "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection.",
     "</output_contract>",
   ].join("\n");
@@ -239,7 +248,8 @@ export function buildImageReviewPrompt(params: ImageReviewPromptParams): string 
     "Inspect them directly before deciding whether the model is a plausible reproduction.",
     "Do not reread SKILL.md through a file tool.",
     "Only rerun Morpheus if the images clearly show that the current model is wrong.",
-    "If you still need another benchmark cycle after this review turn, set needsAnotherCycle=true.",
+    "Do not call create_run; continue using the existing run_id only.",
+    "If reproduction is below 8/8, technical evaluation is below max score, or you identified a concrete weakness, set needsAnotherCycle=true.",
     "Set needsAnotherImageReview=true only if that next cycle specifically needs more image inspection.",
     params.paperImagePaths.length > 0 ? `Attached paper image paths: ${params.paperImagePaths.join(", ")}` : "",
     params.outputImagePaths.length > 0 ? `Attached output image paths: ${params.outputImagePaths.join(", ")}` : "",

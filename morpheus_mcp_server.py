@@ -35,6 +35,7 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parent
 RUNS_ROOT = Path(os.getenv("MORPHEUS_RUNS_DIR", REPO_ROOT / "runs")).expanduser()
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+ACTIVE_RUN_ID_ENV = "MORPHEUS_ACTIVE_RUN_ID"
 
 MORPHEUS_BIN = os.getenv("MORPHEUS_BIN", "morpheus")
 MAX_TEXT_PREVIEW = 1_000
@@ -42,6 +43,7 @@ MAX_READ_CHARS = 50_000
 MAX_REFERENCE_READ_CHARS = 250_000
 MAX_LOG_PREVIEW_CHARS = 1_500
 MAX_OUTPUT_PATHS = 6
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 REFERENCES_ROOT = REPO_ROOT / "references"
 REFERENCE_CATEGORIES = {
@@ -72,10 +74,55 @@ def _new_run_id() -> str:
     return f"{_now_stamp()}_{uuid.uuid4().hex[:8]}"
 
 
+def _active_run_id() -> Optional[str]:
+    run_id = os.getenv(ACTIVE_RUN_ID_ENV, "").strip()
+    return run_id or None
+
+
+def _sanitize_run_name(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
+    return sanitized or "run"
+
+
+def _validate_run_id(run_id: str) -> str:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError(
+            f"Invalid run_id {run_id!r}. Run IDs may only contain letters, numbers, underscores, and hyphens."
+        )
+    return run_id
+
+
+def _coerce_run_id(run_id: Optional[str]) -> str:
+    active_run_id = _active_run_id()
+    if active_run_id:
+        _validate_run_id(active_run_id)
+        if run_id and run_id != active_run_id:
+            raise ValueError(
+                f"Active benchmark run is {active_run_id!r}; received run_id {run_id!r}. "
+                "Use the active run_id exactly and do not create paper-specific output folders."
+            )
+        return active_run_id
+
+    if run_id is None:
+        return _new_run_id()
+    return _validate_run_id(run_id)
+
+
 def _run_dir(run_id: str) -> Path:
-    run_path = RUNS_ROOT / run_id
+    run_id = _validate_run_id(run_id)
+    run_path = (RUNS_ROOT / run_id).resolve()
+    runs_root = RUNS_ROOT.resolve()
+    if run_path != runs_root and runs_root not in run_path.parents:
+        raise ValueError(f"Resolved run directory escapes the configured runs root: {run_path}")
     run_path.mkdir(parents=True, exist_ok=True)
     return run_path
+
+
+def _safe_model_file_name(file_name: str) -> str:
+    candidate = Path(file_name)
+    if candidate.name != file_name or candidate.is_absolute() or file_name in {"", ".", ".."}:
+        raise ValueError("file_name must be a simple file name inside the run directory, e.g. model.xml")
+    return file_name
 
 
 def _ensure_parent(path: Path) -> None:
@@ -410,13 +457,14 @@ def _infer_reference_categories_from_text(text: str) -> Dict[str, Any]:
 
 def _validate_xml_completeness(xml: str) -> Dict[str, Any]:
     cleaned = _sanitize_xml(xml)
+    has_png_terminal = re.search(r"<Terminal\b[^>]*\bname\s*=\s*['\"]png['\"]", cleaned) is not None
     checks = {
         "has_root": "<MorpheusModel" in cleaned and "</MorpheusModel>" in cleaned,
         "has_description": "<Description>" in cleaned and "</Description>" in cleaned,
         "has_space": "<Space>" in cleaned and "</Space>" in cleaned,
         "has_time": "<Time>" in cleaned and "</Time>" in cleaned,
         "has_analysis": "<Analysis>" in cleaned and "</Analysis>" in cleaned,
-        "has_gnuplotter": "<Gnuplotter" in cleaned and "<Terminal name=\"png\"" in cleaned,
+        "has_gnuplotter": "<Gnuplotter" in cleaned and has_png_terminal,
         "has_logger": "<Logger" in cleaned and "<TextOutput" in cleaned,
         "has_model_graph": "<ModelGraph" in cleaned,
         "has_version": 'version="4"' in cleaned or "version='4'" in cleaned,
@@ -578,7 +626,34 @@ def _sample_run_images(run_path: Path, limit: int) -> Dict[str, Any]:
 
 @mcp.tool()
 def create_run(name: Optional[str] = None) -> Dict[str, Any]:
-    run_id = _new_run_id() if not name else f"{_now_stamp()}_{name}"
+    active_run_id = _active_run_id()
+    if active_run_id:
+        run_id = _validate_run_id(active_run_id)
+        run_path = _run_dir(run_id)
+        manifest_path = _merge_manifest(
+            run_id,
+            {
+                "run_id": run_id,
+                "run_dir": str(run_path),
+                "runs_root": str(RUNS_ROOT),
+            },
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "run_dir": str(run_path),
+            "runs_root": str(RUNS_ROOT),
+            "run_manifest_path": str(manifest_path),
+            "note": "Using the active benchmark run; create_run is a no-op inside benchmark cycles.",
+        }
+
+    if name:
+        sanitized_name = _sanitize_run_name(name)
+        existing_path = RUNS_ROOT / sanitized_name
+        run_id = sanitized_name if existing_path.is_dir() else f"{_now_stamp()}_{sanitized_name}"
+    else:
+        run_id = _new_run_id()
+
     run_path = _run_dir(run_id)
     manifest_path = _merge_manifest(
         run_id,
@@ -604,9 +679,11 @@ def extract_paper_text(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
     if not pdf_file.exists():
         return {"ok": False, "error": f"PDF not found: {pdf_path}"}
 
-    if run_id is None:
-        run_id = _new_run_id()
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
 
     try:
         text = _extract_pdf_text(pdf_file)
@@ -656,9 +733,11 @@ def render_pdf_pages(
     if not pdf_file.exists():
         return {"ok": False, "error": f"PDF not found: {pdf_path}"}
 
-    if run_id is None:
-        run_id = _new_run_id()
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     out_dir = run_path / "paper_pages"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -711,9 +790,11 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
     if not pdf_file.exists():
         return {"ok": False, "error": f"PDF not found: {pdf_path}"}
 
-    if run_id is None:
-        run_id = _new_run_id()
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
 
     figures = _list_pdf_figures(pdf_file)
     figure_pages = sorted({figure["page"] for figure in figures if isinstance(figure.get("page"), int)})
@@ -805,9 +886,13 @@ def write_model_xml(
             "error": "Provided XML does not look like a MorpheusModel document",
         }
 
-    if run_id is None:
-        run_id = _new_run_id()
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        file_name = _safe_model_file_name(file_name)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
     xml_path = run_path / file_name
     version_dir = run_path / "xml_versions"
     version_dir.mkdir(parents=True, exist_ok=True)
@@ -850,9 +935,21 @@ def run_morpheus_model(
     if not xml_file.exists():
         return {"ok": False, "error": f"XML not found: {xml_path}"}
 
-    if run_id is None:
-        run_id = xml_file.parent.name
-    run_path = _run_dir(run_id)
+    try:
+        inferred_run_id = None if _active_run_id() else xml_file.parent.name
+        run_id = _coerce_run_id(run_id or inferred_run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if _active_run_id():
+        try:
+            xml_file.relative_to(run_path)
+        except ValueError:
+            return {
+                "ok": False,
+                "error": f"XML path must be inside the active benchmark run directory: {run_path}",
+            }
 
     command = [MORPHEUS_BIN, "-f", str(xml_file), "--outdir", str(run_path)]
     if threads:
@@ -919,7 +1016,11 @@ def run_morpheus_model(
 
 @mcp.tool()
 def summarize_morpheus_run(run_id: str) -> Dict[str, Any]:
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     outputs = _list_outputs(run_path)
     stdout_path = run_path / "stdout.log"
     stderr_path = run_path / "stderr.log"
@@ -959,7 +1060,11 @@ def sample_output_images(
     limit: int = 5,
     create_contact_sheet: bool = False,
 ) -> Dict[str, Any]:
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     sample = _sample_run_images(run_path, limit)
     selected_paths = [_relative_to_run(run_path, path) for path in sample["selected"]]
     contact_sheet_path: Optional[str] = None
@@ -983,7 +1088,11 @@ def sample_output_images(
 
 @mcp.tool()
 def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
-    run_path = _run_dir(run_id)
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     xml_path = run_path / "model.xml"
     stdout_path = run_path / "stdout.log"
     stderr_path = run_path / "stderr.log"

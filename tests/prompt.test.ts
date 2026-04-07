@@ -31,7 +31,8 @@ test("buildCyclePrompt prefers on-demand image inspection", () => {
   assert.match(prompt, /technical_evaluation\.json/);
   assert.match(prompt, /plot_00000\.png/);
   assert.match(prompt, /Likely figure pages: 2, 4/);
-  assert.match(prompt, /render only the specific pages/i);
+  assert.match(prompt, /render only specific pages/i);
+  assert.match(prompt, /do not call create_run/i);
 });
 
 test("buildImageReviewPrompt lists attached review images", () => {
@@ -98,4 +99,33 @@ test("buildCyclePrompt distinguishes another cycle from image review", () => {
 
   assert.match(prompt, /needsAnotherCycle=true/i);
   assert.match(prompt, /needsAnotherImageReview=true/i);
+  assert.match(prompt, /Always pass run_id="run_123"/);
+  assert.match(prompt, /8\/8/);
+});
+
+test("buildCyclePrompt carries host continuation reasons into later cycles", () => {
+  const prompt = buildCyclePrompt({
+    paperName: "ten_Berkhout2025_clean.pdf",
+    pdfPath: "benchmark_papers/ten_Berkhout2025_clean.pdf",
+    runId: "run_berkhout",
+    runDir: "benchmark_runs/run_berkhout",
+    paperTextPath: "benchmark_runs/run_berkhout/paper.txt",
+    pageRenderDpi: 150,
+    representativeOutputFrames: 5,
+    pageManifestPath: null,
+    figureManifestPath: null,
+    likelyFigurePages: [],
+    cycle: 3,
+    previousSummary: "Completed, but still coarse.",
+    previousReproductionScore: 5,
+    hostContinuationReason: "The reproduction rubric is 5/8; continue until all criteria are 2/2.",
+    technicalEvaluationPath: "benchmark_runs/run_berkhout/technical_evaluation.json",
+    paperImagePaths: [],
+    outputImagePaths: [],
+    contactSheetPath: null,
+  });
+
+  assert.match(prompt, /Host continuation reason: The reproduction rubric is 5\/8/);
+  assert.match(prompt, /run_id=run_berkhout/);
+  assert.match(prompt, /do not call create_run/i);
 });
