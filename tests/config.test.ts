@@ -9,6 +9,10 @@ test("loadConfig reads the default benchmark config", async () => {
   assert.equal(config.reasoningEffort, "xhigh");
   assert.equal(config.maxTurnsPerPaper, 5);
   assert.equal(config.pageRenderDpi, 150);
+  assert.equal(config.codexQuotaFallbackEnabled, true);
+  assert.equal(config.codexQuotaFallbackWaitMinutes, 300);
+  assert.equal(config.codexQuotaMaxRetries, 3);
+  assert.equal(config.codexQuotaRetryBufferSeconds, 60);
   assert.ok(config.papersDir.endsWith("benchmark_papers"));
   assert.ok(config.benchmarkFocusDir?.endsWith("benchmark_focus"));
 });

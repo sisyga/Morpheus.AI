@@ -9,6 +9,10 @@ export type BenchmarkConfig = {
   maxTurnsPerPaper: number;
   pageRenderDpi: number;
   representativeOutputFrames: number;
+  codexQuotaFallbackEnabled: boolean;
+  codexQuotaFallbackWaitMinutes: number;
+  codexQuotaMaxRetries: number;
+  codexQuotaRetryBufferSeconds: number;
   mcpCommand: string[];
   skillPaths: string[];
 };

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { decideContinuation } from "../src/benchmark/runner.js";
+import {
+  decideContinuation,
+  getCodexQuotaResetWaitMs,
+  isCodexQuotaLimitError,
+} from "../src/benchmark/runner.js";
 import type { ReproductionReport } from "../src/benchmark/types.js";
 
 const flawlessReproduction = {
@@ -61,4 +65,40 @@ test("decideContinuation allows completion only when reproduction and technical 
 
   assert.equal(decision.shouldContinue, false);
   assert.equal(decision.reason, null);
+});
+
+test("isCodexQuotaLimitError detects Codex usage quota messages", () => {
+  assert.equal(
+    isCodexQuotaLimitError("Codex Exec exited with code 1: usage limit reached. Try again at 4:30 PM."),
+    true,
+  );
+  assert.equal(isCodexQuotaLimitError("Turn stream ended before completion."), false);
+});
+
+test("getCodexQuotaResetWaitMs uses relative reset times plus buffer", () => {
+  const waitMs = getCodexQuotaResetWaitMs("Codex quota reached; try again in 2 hours, 30 minutes.", {
+    fallbackWaitMs: 300 * 60 * 1000,
+    retryBufferMs: 60 * 1000,
+  });
+
+  assert.equal(waitMs, (2 * 60 * 60 + 30 * 60 + 60) * 1000);
+});
+
+test("getCodexQuotaResetWaitMs uses same-day clock reset times", () => {
+  const waitMs = getCodexQuotaResetWaitMs("Codex usage limit reached. Try again at 4:30 PM.", {
+    fallbackWaitMs: 300 * 60 * 1000,
+    retryBufferMs: 60 * 1000,
+    now: new Date(2026, 3, 7, 15, 0, 0, 0),
+  });
+
+  assert.equal(waitMs, (90 * 60 + 60) * 1000);
+});
+
+test("getCodexQuotaResetWaitMs falls back to configured 5h wait when reset time is missing", () => {
+  const waitMs = getCodexQuotaResetWaitMs("Codex quota reached.", {
+    fallbackWaitMs: 300 * 60 * 1000,
+    retryBufferMs: 60 * 1000,
+  });
+
+  assert.equal(waitMs, (300 * 60 + 60) * 1000);
 });

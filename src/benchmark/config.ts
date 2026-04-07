@@ -23,6 +23,10 @@ export async function loadConfig(configPath?: string): Promise<BenchmarkConfig> 
     maxTurnsPerPaper: parsed.maxTurnsPerPaper ?? 5,
     pageRenderDpi: parsed.pageRenderDpi ?? 150,
     representativeOutputFrames: parsed.representativeOutputFrames ?? 5,
+    codexQuotaFallbackEnabled: parsed.codexQuotaFallbackEnabled ?? true,
+    codexQuotaFallbackWaitMinutes: parsed.codexQuotaFallbackWaitMinutes ?? 300,
+    codexQuotaMaxRetries: parsed.codexQuotaMaxRetries ?? 3,
+    codexQuotaRetryBufferSeconds: parsed.codexQuotaRetryBufferSeconds ?? 60,
     mcpCommand: parsed.mcpCommand ?? ["python", "server.py"],
     skillPaths: (parsed.skillPaths ?? [".agents/skills/morpheus/SKILL.md"]).map((skillPath) =>
       path.resolve(process.cwd(), skillPath),

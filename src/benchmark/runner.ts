@@ -1,6 +1,7 @@
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { Codex, type Thread, type ThreadEvent, type ThreadItem, type ThreadOptions, type UserInput } from "@openai/codex-sdk";
 
@@ -57,6 +58,17 @@ type CollectedTurn = {
   error: string | null;
 };
 
+type QuotaFallbackOptions = {
+  context: string;
+  enabled: boolean;
+  fallbackWaitMs: number;
+  maxRetries: number;
+  retryBufferMs: number;
+};
+
+const QUOTA_WAIT_PROGRESS_INTERVAL_MS = 60_000;
+const DURATION_UNIT_PATTERN = "hours|hour|hrs|hr|h|minutes|minute|mins|min|m|seconds|second|secs|sec|s";
+
 export class BenchmarkRunner {
   private readonly bridge: PythonBridge;
   private readonly config: BenchmarkConfig;
@@ -85,6 +97,16 @@ export class BenchmarkRunner {
         },
       },
     });
+  }
+
+  private quotaFallbackOptions(context: string): QuotaFallbackOptions {
+    return {
+      context,
+      enabled: this.config.codexQuotaFallbackEnabled,
+      fallbackWaitMs: minutesToMilliseconds(this.config.codexQuotaFallbackWaitMinutes),
+      maxRetries: Math.floor(nonNegativeNumber(this.config.codexQuotaMaxRetries)),
+      retryBufferMs: secondsToMilliseconds(this.config.codexQuotaRetryBufferSeconds),
+    };
   }
 
   async run(maxPapers?: number): Promise<BenchmarkSummary> {
@@ -246,7 +268,11 @@ export class BenchmarkRunner {
       });
 
       const input = buildTurnInput(prompt, [], [], null);
-      const turn = await collectTurn(thread, input);
+      const turn = await collectTurnWithQuotaFallback(
+        thread,
+        input,
+        this.quotaFallbackOptions(`${paper} cycle ${cycle}`),
+      );
       await writeTranscript(path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}.jsonl`), turn.events);
       if (turn.error) {
         return failedResult(
@@ -300,7 +326,11 @@ export class BenchmarkRunner {
           reviewInspection.outputImagePaths,
           reviewInspection.contactSheetPath,
         );
-        const reviewTurn = await collectTurn(thread, reviewInput);
+        const reviewTurn = await collectTurnWithQuotaFallback(
+          thread,
+          reviewInput,
+          this.quotaFallbackOptions(`${paper} cycle ${cycle} image review`),
+        );
         await writeTranscript(
           path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`),
           reviewTurn.events,
@@ -448,8 +478,45 @@ function buildTurnInput(
   return inputs;
 }
 
+async function collectTurnWithQuotaFallback(
+  thread: Thread,
+  input: UserInput[],
+  options: QuotaFallbackOptions,
+): Promise<CollectedTurn> {
+  const cumulativeEvents: ThreadEvent[] = [];
+  let retries = 0;
+
+  while (true) {
+    const turn = await collectTurn(thread, input);
+    cumulativeEvents.push(...turn.events);
+
+    if (
+      !turn.error ||
+      !options.enabled ||
+      !isCodexQuotaLimitError(turn.error) ||
+      retries >= options.maxRetries
+    ) {
+      return { ...turn, events: cumulativeEvents };
+    }
+
+    retries += 1;
+    const waitMs = getCodexQuotaResetWaitMs(turn.error, {
+      fallbackWaitMs: options.fallbackWaitMs,
+      retryBufferMs: options.retryBufferMs,
+    });
+    const resetAt = new Date(Date.now() + waitMs).toISOString();
+    const message = [
+      `Benchmark host detected a Codex quota/rate limit during ${options.context}.`,
+      `Waiting ${formatDuration(waitMs)} before retry ${retries}/${options.maxRetries}.`,
+      `Approximate retry time: ${resetAt}.`,
+    ].join(" ");
+    cumulativeEvents.push({ type: "error", message });
+    console.warn(message);
+    await sleepWithProgress(waitMs, options.context);
+  }
+}
+
 async function collectTurn(thread: Thread, input: UserInput[]): Promise<CollectedTurn> {
-  const streamed = await thread.runStreamed(input, { outputSchema: FINAL_RESPONSE_SCHEMA });
   const events: ThreadEvent[] = [];
   const items = new Map<string, ThreadItem>();
   let usage: CollectedTurn["usage"] = null;
@@ -458,28 +525,33 @@ async function collectTurn(thread: Thread, input: UserInput[]): Promise<Collecte
   let turnFailedMessage: string | null = null;
   let recoverableStreamError: string | null = null;
 
-  for await (const event of streamed.events) {
-    events.push(event);
-    if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
-      items.set(event.item.id, event.item);
-      if (event.item.type === "agent_message") {
-        finalResponse = event.item.text;
+  try {
+    const streamed = await thread.runStreamed(input, { outputSchema: FINAL_RESPONSE_SCHEMA });
+    for await (const event of streamed.events) {
+      events.push(event);
+      if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+        items.set(event.item.id, event.item);
+        if (event.item.type === "agent_message") {
+          finalResponse = event.item.text;
+        }
+      }
+      if (event.type === "turn.completed") {
+        usage = event.usage;
+        turnCompleted = true;
+      }
+      if (event.type === "turn.failed") {
+        turnFailedMessage = event.error.message;
+      }
+      if (event.type === "error") {
+        if (isRecoverableStreamError(event.message)) {
+          recoverableStreamError = event.message;
+          continue;
+        }
+        return { finalResponse, usage, events, items: [...items.values()], error: event.message };
       }
     }
-    if (event.type === "turn.completed") {
-      usage = event.usage;
-      turnCompleted = true;
-    }
-    if (event.type === "turn.failed") {
-      turnFailedMessage = event.error.message;
-    }
-    if (event.type === "error") {
-      if (isRecoverableStreamError(event.message)) {
-        recoverableStreamError = event.message;
-        continue;
-      }
-      return { finalResponse, usage, events, items: [...items.values()], error: event.message };
-    }
+  } catch (error) {
+    return { finalResponse, usage, events, items: [...items.values()], error: stringifyError(error) };
   }
 
   if (turnFailedMessage) {
@@ -513,6 +585,203 @@ function isRecoverableStreamError(message: string): boolean {
     normalized.includes("stream disconnected before completion") ||
     normalized.includes("websocket closed by server")
   );
+}
+
+function stringifyError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+export function isCodexQuotaLimitError(message: string): boolean {
+  const normalized = message.toLowerCase().replace(/[_-]+/g, " ");
+  const quotaSignal =
+    normalized.includes("quota") ||
+    normalized.includes("usage limit") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("429") ||
+    normalized.includes("5h") ||
+    normalized.includes("5 hour") ||
+    normalized.includes("5-hour") ||
+    normalized.includes("five hour") ||
+    normalized.includes("five-hour") ||
+    normalized.includes("weekly limit") ||
+    normalized.includes("daily limit") ||
+    normalized.includes("request limit");
+  if (!quotaSignal) {
+    return false;
+  }
+
+  return (
+    normalized.includes("codex") ||
+    normalized.includes("openai") ||
+    normalized.includes("chatgpt") ||
+    normalized.includes("try again") ||
+    normalized.includes("retry") ||
+    normalized.includes("reset") ||
+    normalized.includes("exceeded") ||
+    normalized.includes("reached")
+  );
+}
+
+export function getCodexQuotaResetWaitMs(
+  message: string,
+  options: {
+    fallbackWaitMs: number;
+    retryBufferMs: number;
+    now?: Date;
+  },
+): number {
+  const now = options.now ?? new Date();
+  const retryBufferMs = nonNegativeNumber(options.retryBufferMs);
+  const relativeWaitMs = parseRelativeWaitMs(message);
+  if (relativeWaitMs !== null) {
+    return nonNegativeNumber(relativeWaitMs) + retryBufferMs;
+  }
+
+  const absoluteResetMs = parseAbsoluteResetMs(message, now);
+  if (absoluteResetMs !== null) {
+    return nonNegativeNumber(absoluteResetMs - now.getTime()) + retryBufferMs;
+  }
+
+  return nonNegativeNumber(options.fallbackWaitMs) + retryBufferMs;
+}
+
+function parseRelativeWaitMs(message: string): number | null {
+  const durationPattern = new RegExp(
+    `((?:\\d+(?:\\.\\d+)?\\s*(?:${DURATION_UNIT_PATTERN})\\s*(?:,?\\s*(?:and\\s*)?)?)+)`,
+    "i",
+  );
+  const contextual = message.match(
+    new RegExp(
+      `(?:try again|retry|reset(?:s)?|available|quota|limit)[^\\n.]{0,120}\\bin\\s+${durationPattern.source}`,
+      "i",
+    ),
+  );
+  const fallback = message.match(new RegExp(`\\bin\\s+${durationPattern.source}`, "i"));
+  const duration = contextual?.[1] ?? fallback?.[1];
+  if (!duration) {
+    return null;
+  }
+
+  let totalMs = 0;
+  const partPattern = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${DURATION_UNIT_PATTERN})`, "gi");
+  for (const match of duration.matchAll(partPattern)) {
+    const value = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (unit.startsWith("h")) {
+      totalMs += value * 60 * 60 * 1000;
+    } else if (unit.startsWith("m")) {
+      totalMs += value * 60 * 1000;
+    } else {
+      totalMs += value * 1000;
+    }
+  }
+
+  return totalMs > 0 ? totalMs : null;
+}
+
+function parseAbsoluteResetMs(message: string, now: Date): number | null {
+  const isoMatch = message.match(
+    /\b20\d{2}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b/,
+  );
+  if (isoMatch) {
+    const parsed = Date.parse(isoMatch[0]);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  const phraseMatch = message.match(
+    /(?:try again|retry|reset(?:s)?|available|quota|limit)[^\n.]{0,120}\b(?:at|after|until)\s+([^\n.;)]+)/i,
+  );
+  if (phraseMatch) {
+    const parsed = Date.parse(phraseMatch[1].trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  const timeMatch = message.match(
+    /(?:try again|retry|reset(?:s)?|available|quota|limit)[^\n.]{0,120}\b(?:at|after|until)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i,
+  );
+  if (!timeMatch) {
+    return null;
+  }
+
+  let hour = Number(timeMatch[1]);
+  const minute = timeMatch[2] ? Number(timeMatch[2]) : 0;
+  const meridiem = timeMatch[3]?.toLowerCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || minute > 59) {
+    return null;
+  }
+  if (meridiem === "pm" && hour < 12) {
+    hour += 12;
+  }
+  if (meridiem === "am" && hour === 12) {
+    hour = 0;
+  }
+  if (hour > 23) {
+    return null;
+  }
+
+  const reset = new Date(now);
+  reset.setHours(hour, minute, 0, 0);
+  if (reset.getTime() <= now.getTime()) {
+    reset.setDate(reset.getDate() + 1);
+  }
+  return reset.getTime();
+}
+
+async function sleepWithProgress(waitMs: number, context: string): Promise<void> {
+  const startedAt = Date.now();
+  const targetAt = startedAt + nonNegativeNumber(waitMs);
+  let nextProgressAt = startedAt + QUOTA_WAIT_PROGRESS_INTERVAL_MS;
+
+  while (Date.now() < targetAt) {
+    const now = Date.now();
+    const chunkMs = Math.min(targetAt - now, Math.max(1, nextProgressAt - now));
+    await sleep(chunkMs);
+    if (Date.now() >= nextProgressAt && Date.now() < targetAt) {
+      console.warn(
+        `Still waiting for Codex quota reset during ${context}; ${formatDuration(targetAt - Date.now())} remaining.`,
+      );
+      nextProgressAt += QUOTA_WAIT_PROGRESS_INTERVAL_MS;
+    }
+  }
+}
+
+function minutesToMilliseconds(minutes: number): number {
+  return nonNegativeNumber(minutes) * 60_000;
+}
+
+function secondsToMilliseconds(seconds: number): number {
+  return nonNegativeNumber(seconds) * 1000;
+}
+
+function nonNegativeNumber(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.ceil(nonNegativeNumber(milliseconds) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts: string[] = [];
+  if (hours > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0 || hours > 0) {
+    parts.push(`${minutes}m`);
+  }
+  parts.push(`${seconds}s`);
+  return parts.join(" ");
 }
 
 function average(values: number[]): number {

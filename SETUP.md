@@ -206,6 +206,10 @@ The default configuration is stored in `benchmark.config.json`:
   "maxTurnsPerPaper": 5,
   "pageRenderDpi": 150,
   "representativeOutputFrames": 5,
+  "codexQuotaFallbackEnabled": true,
+  "codexQuotaFallbackWaitMinutes": 300,
+  "codexQuotaMaxRetries": 3,
+  "codexQuotaRetryBufferSeconds": 60,
   "mcpCommand": ["python", "server.py"],
   "skillPaths": [".agents/skills/morpheus/SKILL.md"]
 }
@@ -224,6 +228,14 @@ Important fields:
   Preferred resolution used when the agent requests specific paper pages for rendering.
 - `representativeOutputFrames`
   Preferred number of Morpheus output images the agent should sample when it asks for visual inspection.
+- `codexQuotaFallbackEnabled`
+  Whether Codex quota/rate-limit errors should pause and retry instead of failing the paper immediately.
+- `codexQuotaFallbackWaitMinutes`
+  Wait time used when Codex reports a quota/rate-limit error without an exact reset time.
+- `codexQuotaMaxRetries`
+  Maximum quota/rate-limit retries per Codex turn.
+- `codexQuotaRetryBufferSeconds`
+  Extra buffer added after a parsed reset time or fallback wait before retrying.
 - `mcpCommand`
   Command used to start the MCP server.
 - `skillPaths`

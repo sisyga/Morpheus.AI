@@ -7,6 +7,10 @@
   "maxTurnsPerPaper": 5,
   "pageRenderDpi": 150,
   "representativeOutputFrames": 5,
+  "codexQuotaFallbackEnabled": true,
+  "codexQuotaFallbackWaitMinutes": 300,
+  "codexQuotaMaxRetries": 3,
+  "codexQuotaRetryBufferSeconds": 60,
   "mcpCommand": ["python", "server.py"],
   "skillPaths": [".agents/skills/morpheus/SKILL.md"]
 }

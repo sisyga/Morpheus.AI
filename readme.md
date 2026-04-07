@@ -155,6 +155,7 @@ At the benchmark root, `benchmark_summary.json` aggregates the run status and sc
 - Images are not automatically reattached in later cycles. If the agent still needs them, it must request them again.
 - The technical score is deterministic, but the reproduction report is a structured qualitative assessment returned by the agent from the staged evidence.
 - Results can vary between runs because the benchmark depends on an LLM-driven modeling loop. In practice, a one-paper smoke test is the best first check, and repeated full runs should be interpreted as distributions rather than perfectly fixed outputs.
+- Codex quota/rate-limit errors are handled by the runner. When the CLI reports a reset time, the runner waits until that time plus `codexQuotaRetryBufferSeconds`; otherwise it waits `codexQuotaFallbackWaitMinutes` before retrying, up to `codexQuotaMaxRetries` per turn. Set `codexQuotaFallbackEnabled` to `false` or pass `--no-codex-quota-fallback` to fail immediately instead.
 
 ## Supported workflow vs. legacy material
 
