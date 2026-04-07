@@ -20,6 +20,10 @@ class MorpheusMcpServerTests(unittest.TestCase):
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
         server.os.environ.pop(server.ACTIVE_RUN_ID_ENV, None)
+        self.original_model_repo_dir = server.MODEL_REPO_DIR
+        self.original_packed_model_repo_path = server.PACKED_MODEL_REPO_PATH
+        self.addCleanup(lambda: setattr(server, "MODEL_REPO_DIR", self.original_model_repo_dir))
+        self.addCleanup(lambda: setattr(server, "PACKED_MODEL_REPO_PATH", self.original_packed_model_repo_path))
 
     def test_write_model_xml_creates_versioned_copies(self) -> None:
         result = server.write_model_xml(
@@ -121,6 +125,74 @@ class MorpheusMcpServerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["total_score"], 6)
         self.assertEqual(result["breakdown"]["png_count"], 10)
+
+    def test_model_example_corpus_search_reads_sections_and_assets(self) -> None:
+        corpus_root = server.RUNS_ROOT / "fake_model_repo"
+        model_dir = corpus_root / "Contributed Examples" / "Multiscale" / "Diffusible Signal"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "index.md").write_text(
+            """---
+MorpheusModelID: M5491
+title: Mass-conserving secretion and uptake of a diffusible signal
+tags:
+- CPM
+- PDE
+- Multiscale
+- Chemotaxis
+---
+
+This model demonstrates secretion, uptake, and chemotaxis.
+
+![](plot.png "Signal snapshot")
+""",
+            encoding="utf-8",
+        )
+        (model_dir / "plot.png").write_text("fake image", encoding="utf-8")
+        (model_dir / "DiffusibleSignal.xml").write_text(
+            """
+            <MorpheusModel version="4">
+              <Description><Title>Diffusible Signal</Title></Description>
+              <Space></Space>
+              <Time></Time>
+              <Global>
+                <Field symbol="U.external" value="0"><Diffusion rate="0.1"/></Field>
+              </Global>
+              <CPM><Interaction></Interaction></CPM>
+              <Analysis>
+                <Gnuplotter><Terminal name="png"/></Gnuplotter>
+              </Analysis>
+            </MorpheusModel>
+            """,
+            encoding="utf-8",
+        )
+
+        server.MODEL_REPO_DIR = corpus_root
+        server.PACKED_MODEL_REPO_PATH = server.RUNS_ROOT / "missing_model_repository.txt"
+
+        search = server.search_model_examples(
+            query="diffusible signal uptake chemotaxis",
+            model_type="Multiscale",
+            limit=3,
+        )
+        self.assertTrue(search["ok"])
+        self.assertEqual(search["source"], "model_repo_dir")
+        self.assertEqual(search["record_count"], 1)
+        example_id = search["results"][0]["example_id"]
+        self.assertEqual(
+            example_id,
+            "Contributed Examples/Multiscale/Diffusible Signal/DiffusibleSignal.xml",
+        )
+        self.assertEqual(search["results"][0]["asset_counts"]["images"], 1)
+
+        section = server.read_model_example_section(example_id, "Analysis")
+        self.assertTrue(section["ok"])
+        self.assertEqual(section["match_count"], 1)
+        self.assertIn("Gnuplotter", section["content"])
+
+        assets = server.list_model_example_assets(example_id)
+        self.assertTrue(assets["ok"])
+        self.assertEqual(assets["asset_counts"]["images"], 1)
+        self.assertTrue(assets["assets"][0]["path"].endswith("plot.png"))
 
 
 if __name__ == "__main__":

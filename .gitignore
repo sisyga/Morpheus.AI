@@ -22,4 +22,7 @@ MWE/
 correction.json
 runs/
 benchmark_runs/
+corpus/model-repo/
+corpus/*.sqlite
+corpus/*.db
 

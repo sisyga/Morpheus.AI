@@ -7,9 +7,10 @@ import re
 import shutil
 import subprocess
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from dotenv import load_dotenv
 
@@ -52,6 +53,58 @@ REFERENCE_CATEGORIES = {
     "ODE": REFERENCES_ROOT / "ODE",
     "Multiscale": REFERENCES_ROOT / "Multiscale",
     "Miscellaneous": REFERENCES_ROOT / "Miscellaneous",
+}
+CORPUS_ROOT = REPO_ROOT / "corpus"
+MODEL_REPO_DIR = Path(os.getenv("MORPHEUS_MODEL_REPO_DIR", str(CORPUS_ROOT / "model-repo"))).expanduser()
+if not MODEL_REPO_DIR.is_absolute():
+    MODEL_REPO_DIR = (REPO_ROOT / MODEL_REPO_DIR).resolve()
+PACKED_MODEL_REPO_PATH = Path(
+    os.getenv("MORPHEUS_MODEL_REPO_TXT", str(REFERENCES_ROOT / "model_repository.txt"))
+).expanduser()
+if not PACKED_MODEL_REPO_PATH.is_absolute():
+    PACKED_MODEL_REPO_PATH = (REPO_ROOT / PACKED_MODEL_REPO_PATH).resolve()
+
+MODEL_REPO_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".svg", ".tif", ".tiff", ".gif"}
+MODEL_REPO_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov"}
+MODEL_REPO_ASSET_EXTENSIONS = MODEL_REPO_IMAGE_EXTENSIONS | MODEL_REPO_VIDEO_EXTENSIONS | {".zip"}
+MODEL_REPO_TEXT_EXTENSIONS = {".md", ".xml", ".txt"}
+MAX_MODEL_EXAMPLE_READ_CHARS = 250_000
+MAX_MODEL_EXAMPLE_SECTION_CHARS = 40_000
+MODEL_EXAMPLE_RESULT_LIMIT = 20
+MODEL_EXAMPLE_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "are",
+    "based",
+    "between",
+    "both",
+    "can",
+    "cell",
+    "cells",
+    "data",
+    "during",
+    "each",
+    "figure",
+    "from",
+    "has",
+    "have",
+    "into",
+    "model",
+    "models",
+    "not",
+    "paper",
+    "results",
+    "show",
+    "shows",
+    "simulation",
+    "the",
+    "their",
+    "this",
+    "that",
+    "using",
+    "with",
 }
 
 mcp = FastMCP(
@@ -453,6 +506,530 @@ def _infer_reference_categories_from_text(text: str) -> Dict[str, Any]:
         selected = ["Miscellaneous"]
 
     return {"scores": scores, "selected_categories": selected}
+
+
+def _normalize_repo_relpath(path: Path | str) -> str:
+    return str(path).replace("\\", "/")
+
+
+def _parse_scalar_metadata(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [item.strip().strip("\"'") for item in inner.split(",") if item.strip()]
+    return value.strip("\"'")
+
+
+def _parse_markdown_front_matter(text: str) -> Tuple[Dict[str, Any], str]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+
+    metadata: Dict[str, Any] = {}
+    current_key: Optional[str] = None
+    body_start = 0
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            body_start = index + 1
+            break
+
+        key_match = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if key_match:
+            key = key_match.group(1)
+            raw_value = key_match.group(2)
+            parsed_value = _parse_scalar_metadata(raw_value)
+            metadata[key] = parsed_value
+            current_key = key
+            continue
+
+        list_match = re.match(r"^\s*-\s+(.+)$", line)
+        if list_match and current_key:
+            existing = metadata.get(current_key)
+            if not isinstance(existing, list):
+                existing = []
+                metadata[current_key] = existing
+            existing.append(list_match.group(1).strip().strip("\"'"))
+
+    if body_start == 0:
+        return metadata, text
+    return metadata, "\n".join(lines[body_start:])
+
+
+def _strip_markup(text: str, max_chars: int = 800) -> str:
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[#*_`>{}|]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _extract_xml_title(xml_text: str) -> Optional[str]:
+    match = re.search(r"<Title\b[^>]*>(.*?)</Title>", xml_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", match.group(1))).strip() or None
+
+
+def _extract_xml_details(xml_text: str, max_chars: int = 800) -> str:
+    match = re.search(r"<Details\b[^>]*>(.*?)</Details>", xml_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return _strip_markup(match.group(1), max_chars=max_chars)
+
+
+def _extract_model_id(*texts: str) -> Optional[str]:
+    for text in texts:
+        match = re.search(r"\b(M\d{4,})\b", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def _extract_xml_tags(xml_text: str, limit: int = 80) -> List[str]:
+    tags: List[str] = []
+    seen: Set[str] = set()
+    for match in re.finditer(r"<\s*/?\s*([A-Za-z_][A-Za-z0-9_.:-]*)\b", xml_text):
+        tag = match.group(1)
+        if tag.startswith("?") or tag.startswith("!"):
+            continue
+        if tag not in seen:
+            tags.append(tag)
+            seen.add(tag)
+        if len(tags) >= limit:
+            break
+    return tags
+
+
+def _asset_kind(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix in MODEL_REPO_IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in MODEL_REPO_VIDEO_EXTENSIONS:
+        return "video"
+    return "asset"
+
+
+def _extract_markdown_assets(
+    markdown_text: str,
+    model_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    assets: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    patterns = [
+        re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)"),
+        re.compile(r"\bsrc=\"([^\"]+)\""),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(markdown_text):
+            rel = match.group(1).strip()
+            if not rel or rel.startswith(("http://", "https://", "#")):
+                continue
+            suffix = Path(rel.split("#", 1)[0]).suffix.lower()
+            if suffix not in MODEL_REPO_ASSET_EXTENSIONS:
+                continue
+            caption = match.group(2).strip() if len(match.groups()) > 1 and match.group(2) else ""
+            local_path = model_dir / rel if model_dir else None
+            key = str(local_path.resolve()) if local_path and local_path.exists() else rel
+            if key in seen:
+                continue
+            seen.add(key)
+            assets.append(
+                {
+                    "kind": _asset_kind(rel),
+                    "relative_path": _normalize_repo_relpath(rel),
+                    "path": str(local_path.resolve()) if local_path and local_path.exists() else None,
+                    "exists": bool(local_path and local_path.exists()),
+                    "caption": caption,
+                    "referenced_in_markdown": True,
+                }
+            )
+
+    return assets
+
+
+def _list_local_model_assets(model_dir: Path, existing: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    assets = list(existing)
+    seen = {asset.get("path") or asset.get("relative_path") for asset in assets}
+    for path in sorted(model_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in MODEL_REPO_ASSET_EXTENSIONS:
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        assets.append(
+            {
+                "kind": _asset_kind(path.name),
+                "relative_path": path.name,
+                "path": resolved,
+                "exists": True,
+                "caption": "",
+                "referenced_in_markdown": False,
+            }
+        )
+    return assets
+
+
+def _model_types_from_record(path_text: str, tags: Sequence[str], plugins: Sequence[str]) -> List[str]:
+    metadata_haystack = " ".join([path_text, *tags]).lower()
+    plugin_haystack = " ".join(plugins).lower()
+    model_types: List[str] = []
+
+    has_cpm = (
+        "cellular potts" in metadata_haystack
+        or _text_contains_term(metadata_haystack, "cpm")
+        or _text_contains_term(plugin_haystack, "cpm")
+    )
+    has_pde = (
+        "partial differential" in metadata_haystack
+        or _text_contains_term(metadata_haystack, "pde")
+        or _text_contains_term(plugin_haystack, "diffusion")
+    )
+    has_ode = "ordinary differential" in metadata_haystack or _text_contains_term(metadata_haystack, "ode")
+    has_multiscale = _text_contains_term(metadata_haystack, "multiscale") or (has_cpm and (has_pde or has_ode))
+
+    if has_cpm:
+        model_types.append("CPM")
+    if has_pde:
+        model_types.append("PDE")
+    if has_ode:
+        model_types.append("ODE")
+    if has_multiscale:
+        model_types.append("Multiscale")
+    return model_types
+
+
+def _asset_counts(assets: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts = Counter(asset.get("kind", "asset") for asset in assets)
+    return {
+        "images": int(counts.get("image", 0)),
+        "videos": int(counts.get("video", 0)),
+        "other_assets": int(sum(count for kind, count in counts.items() if kind not in {"image", "video"})),
+    }
+
+
+def _text_contains_term(text: str, term: str) -> bool:
+    if re.fullmatch(r"[A-Za-z0-9]+", term) and len(term) <= 3:
+        return re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text) is not None
+    return term in text
+
+
+def _record_search_text(record: Dict[str, Any], xml_text: str) -> str:
+    return " ".join(
+        [
+            str(record.get("title", "")),
+            str(record.get("example_id", "")),
+            str(record.get("category", "")),
+            " ".join(record.get("tags", [])),
+            " ".join(record.get("model_types", [])),
+            " ".join(record.get("plugins", [])),
+            str(record.get("summary", "")),
+            _extract_xml_details(xml_text, max_chars=1_500),
+        ]
+    ).lower()
+
+
+def _make_model_record(
+    *,
+    source: str,
+    example_id: str,
+    rel_path: str,
+    xml_text: str,
+    index_markdown: str = "",
+    model_markdown: str = "",
+    model_dir: Optional[Path] = None,
+    xml_abs_path: Optional[Path] = None,
+    index_abs_path: Optional[Path] = None,
+    model_abs_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    metadata, index_body = _parse_markdown_front_matter(index_markdown)
+    model_metadata, model_body = _parse_markdown_front_matter(model_markdown)
+    tags = metadata.get("tags") or model_metadata.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+
+    title = metadata.get("title") or model_metadata.get("title") or _extract_xml_title(xml_text) or Path(rel_path).stem
+    model_id = (
+        metadata.get("MorpheusModelID")
+        or model_metadata.get("MorpheusModelID")
+        or _extract_model_id(index_markdown, model_markdown, xml_text)
+    )
+    contributors = metadata.get("contributors") or model_metadata.get("contributors") or metadata.get("authors") or []
+    if isinstance(contributors, str):
+        contributors = [contributors]
+
+    rel_parts = rel_path.split("/")
+    category = rel_parts[0] if rel_parts else ""
+    subcategory = "/".join(rel_parts[:2]) if len(rel_parts) >= 2 else category
+    model_name = rel_parts[-2] if len(rel_parts) >= 2 else Path(rel_path).stem
+    plugins = _extract_xml_tags(xml_text)
+    summary = _strip_markup(index_body or model_body or _extract_xml_details(xml_text), max_chars=1_000)
+    markdown_assets = _extract_markdown_assets("\n\n".join([index_markdown, model_markdown]), model_dir=model_dir)
+    assets = _list_local_model_assets(model_dir, markdown_assets) if model_dir and model_dir.exists() else markdown_assets
+
+    record: Dict[str, Any] = {
+        "example_id": example_id,
+        "source": source,
+        "model_id": str(model_id) if model_id else None,
+        "title": str(title),
+        "model_name": model_name,
+        "category": category,
+        "subcategory": subcategory,
+        "repo_path": rel_path,
+        "tags": [str(tag) for tag in tags],
+        "contributors": [str(contributor) for contributor in contributors],
+        "plugins": plugins,
+        "model_types": _model_types_from_record(rel_path, [str(tag) for tag in tags], plugins),
+        "summary": summary,
+        "asset_counts": _asset_counts(assets),
+        "sample_assets": assets[:5],
+        "_assets": assets,
+        "_xml_content": xml_text if source == "packed_txt" else None,
+        "_xml_abs_path": str(xml_abs_path.resolve()) if xml_abs_path else None,
+        "_index_content": index_markdown if source == "packed_txt" else None,
+        "_model_content": model_markdown if source == "packed_txt" else None,
+        "_index_abs_path": str(index_abs_path.resolve()) if index_abs_path else None,
+        "_model_abs_path": str(model_abs_path.resolve()) if model_abs_path else None,
+    }
+    record["_search_text"] = _record_search_text(record, xml_text)
+    return record
+
+
+def _load_model_repo_dir_records(model_repo_dir: Path) -> List[Dict[str, Any]]:
+    if not model_repo_dir.exists() or not model_repo_dir.is_dir():
+        return []
+    records: List[Dict[str, Any]] = []
+    for xml_path in sorted(model_repo_dir.rglob("*.xml")):
+        if ".git" in xml_path.parts:
+            continue
+        rel_path = _normalize_repo_relpath(xml_path.resolve().relative_to(model_repo_dir.resolve()))
+        model_dir = xml_path.parent
+        index_path = model_dir / "index.md"
+        model_path = model_dir / "model.md"
+        xml_text = _read_text(xml_path, max_chars=1_000_000)
+        index_markdown = _read_text(index_path, max_chars=100_000) if index_path.exists() else ""
+        model_markdown = _read_text(model_path, max_chars=100_000) if model_path.exists() else ""
+        records.append(
+            _make_model_record(
+                source="model_repo_dir",
+                example_id=rel_path,
+                rel_path=rel_path,
+                xml_text=xml_text,
+                index_markdown=index_markdown,
+                model_markdown=model_markdown,
+                model_dir=model_dir,
+                xml_abs_path=xml_path,
+                index_abs_path=index_path if index_path.exists() else None,
+                model_abs_path=model_path if model_path.exists() else None,
+            )
+        )
+    return records
+
+
+def _parse_packed_model_repo(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    text = _read_text(path, max_chars=20_000_000)
+    files: Dict[str, str] = {}
+    matches = list(re.finditer(r"^## File:\s+(.+)$", text, flags=re.MULTILINE))
+    for index, match in enumerate(matches):
+        rel_path = match.group(1).strip()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = text[start:end].strip()
+        fence_match = re.match(r"````[A-Za-z0-9_-]*\s*\n(.*)\n````\s*$", block, flags=re.DOTALL)
+        files[_normalize_repo_relpath(rel_path)] = fence_match.group(1) if fence_match else block
+    return files
+
+
+def _load_packed_model_repo_records(path: Path) -> List[Dict[str, Any]]:
+    packed_files = _parse_packed_model_repo(path)
+    records: List[Dict[str, Any]] = []
+    for rel_path, xml_text in sorted(packed_files.items()):
+        if not rel_path.endswith(".xml"):
+            continue
+        model_dir = _normalize_repo_relpath(Path(rel_path).parent)
+        index_markdown = packed_files.get(f"{model_dir}/index.md", "")
+        model_markdown = packed_files.get(f"{model_dir}/model.md", "")
+        records.append(
+            _make_model_record(
+                source="packed_txt",
+                example_id=rel_path,
+                rel_path=rel_path,
+                xml_text=xml_text,
+                index_markdown=index_markdown,
+                model_markdown=model_markdown,
+                model_dir=None,
+            )
+        )
+    return records
+
+
+def _load_model_example_records() -> Tuple[str, List[Dict[str, Any]]]:
+    records = _load_model_repo_dir_records(MODEL_REPO_DIR)
+    if records:
+        return "model_repo_dir", records
+    records = _load_packed_model_repo_records(PACKED_MODEL_REPO_PATH)
+    if records:
+        return "packed_txt", records
+    return "missing", []
+
+
+def _public_model_record(record: Dict[str, Any], include_assets: bool = False) -> Dict[str, Any]:
+    public = {key: value for key, value in record.items() if not key.startswith("_")}
+    if include_assets:
+        public["assets"] = record.get("_assets", [])
+    return public
+
+
+def _tokenize_model_query(text: str, limit: int = 80) -> List[str]:
+    terms = [
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9_.+-]+", text)
+        if len(term) > 2 and term.lower() not in MODEL_EXAMPLE_STOPWORDS
+    ]
+    if len(terms) <= limit:
+        return terms
+    counts = Counter(terms)
+    return [term for term, _count in counts.most_common(limit)]
+
+
+def _score_model_example(record: Dict[str, Any], terms: Sequence[str]) -> float:
+    if not terms:
+        return 0.0
+    title = str(record.get("title", "")).lower()
+    tags = " ".join(record.get("tags", [])).lower()
+    plugins = " ".join(record.get("plugins", [])).lower()
+    path = str(record.get("repo_path", "")).lower()
+    summary = str(record.get("summary", "")).lower()
+    search_text = str(record.get("_search_text", "")).lower()
+
+    score = 0.0
+    for term in terms:
+        if _text_contains_term(title, term):
+            score += 6
+        if _text_contains_term(tags, term):
+            score += 5
+        if _text_contains_term(plugins, term):
+            score += 4
+        if _text_contains_term(path, term):
+            score += 3
+        if _text_contains_term(summary, term):
+            score += 2
+        if _text_contains_term(search_text, term):
+            score += 1
+    return score
+
+
+def _find_model_record(example_id: str) -> Tuple[Optional[Dict[str, Any]], str, List[Dict[str, Any]]]:
+    source, records = _load_model_example_records()
+    normalized = _normalize_repo_relpath(example_id).strip("/")
+    for record in records:
+        if record.get("example_id") == normalized or record.get("model_id") == normalized.upper():
+            return record, source, records
+    return None, source, records
+
+
+def _read_model_record_xml(record: Dict[str, Any], max_chars: int = MAX_MODEL_EXAMPLE_READ_CHARS) -> str:
+    xml_path = record.get("_xml_abs_path")
+    if xml_path:
+        return _read_text(Path(str(xml_path)), max_chars=max_chars)
+    return str(record.get("_xml_content") or "")[:max_chars]
+
+
+def _read_model_record_markdown(record: Dict[str, Any], key: str, max_chars: int = 100_000) -> str:
+    path_key = f"_{key}_abs_path"
+    content_key = f"_{key}_content"
+    markdown_path = record.get(path_key)
+    if markdown_path:
+        return _read_text(Path(str(markdown_path)), max_chars=max_chars)
+    return str(record.get(content_key) or "")[:max_chars]
+
+
+def _extract_xml_section(xml_text: str, section: str) -> Tuple[str, int]:
+    section = section.strip()
+    if section.lower() in {"full", "xml", "model"}:
+        return xml_text, 1 if xml_text else 0
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", section):
+        raise ValueError("section must be an XML tag name such as Analysis, CPM, Global, or CellTypes")
+
+    pattern = re.compile(
+        rf"<{re.escape(section)}\b[^>]*>.*?</{re.escape(section)}>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    matches = pattern.findall(xml_text)
+    if not matches:
+        self_closing = re.compile(rf"<{re.escape(section)}\b[^>]*/>", flags=re.IGNORECASE | re.DOTALL)
+        matches = self_closing.findall(xml_text)
+    return "\n\n".join(matches), len(matches)
+
+
+def _search_model_example_records(
+    *,
+    query: str = "",
+    model_type: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Optional[Sequence[str]] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    source, records = _load_model_example_records()
+    limit = max(1, min(limit, MODEL_EXAMPLE_RESULT_LIMIT))
+    terms = _tokenize_model_query(query)
+    required_tags = [tag.lower() for tag in (tags or []) if tag]
+    model_type_l = model_type.lower() if model_type else None
+    category_l = category.lower() if category else None
+
+    ranked: List[Tuple[float, Dict[str, Any]]] = []
+    for record in records:
+        haystack = " ".join(
+            [
+                str(record.get("category", "")),
+                str(record.get("subcategory", "")),
+                str(record.get("repo_path", "")),
+                " ".join(record.get("tags", [])),
+                " ".join(record.get("model_types", [])),
+                " ".join(record.get("plugins", [])),
+                str(record.get("_search_text", "")),
+            ]
+        ).lower()
+        if category_l and category_l not in haystack:
+            continue
+        if model_type_l and not _text_contains_term(haystack, model_type_l):
+            continue
+        if required_tags and not all(_text_contains_term(haystack, tag) for tag in required_tags):
+            continue
+
+        score = _score_model_example(record, terms)
+        if not terms:
+            score += 1
+        if model_type_l:
+            score += 8
+        if category_l:
+            score += 4
+        if required_tags:
+            score += 4 * len(required_tags)
+        ranked.append((score, record))
+
+    ranked.sort(key=lambda item: (-item[0], str(item[1].get("repo_path", ""))))
+    return {
+        "ok": True,
+        "source": source,
+        "model_repo_dir": str(MODEL_REPO_DIR),
+        "packed_model_repo_path": str(PACKED_MODEL_REPO_PATH),
+        "record_count": len(records),
+        "query_terms": terms,
+        "results": [
+            {**_public_model_record(record), "score": score}
+            for score, record in ranked[:limit]
+        ],
+    }
 
 
 def _validate_xml_completeness(xml: str) -> Dict[str, Any]:
@@ -864,6 +1441,165 @@ def read_reference(category: str, name: str, max_chars: int = MAX_REFERENCE_READ
         "path": str(path),
         "content": content,
         "validation": _validate_xml_completeness(content) if path.suffix == ".xml" else None,
+    }
+
+
+@mcp.tool()
+def get_model_example_corpus_status() -> Dict[str, Any]:
+    """Report which Morpheus example corpus source is active."""
+    source, records = _load_model_example_records()
+    category_counts = Counter(str(record.get("category", "")) for record in records)
+    type_counts = Counter(
+        model_type
+        for record in records
+        for model_type in record.get("model_types", [])
+    )
+    asset_totals = {
+        "images": sum(record.get("asset_counts", {}).get("images", 0) for record in records),
+        "videos": sum(record.get("asset_counts", {}).get("videos", 0) for record in records),
+        "other_assets": sum(record.get("asset_counts", {}).get("other_assets", 0) for record in records),
+    }
+    return {
+        "ok": True,
+        "source": source,
+        "record_count": len(records),
+        "model_repo_dir": str(MODEL_REPO_DIR),
+        "model_repo_dir_exists": MODEL_REPO_DIR.exists(),
+        "packed_model_repo_path": str(PACKED_MODEL_REPO_PATH),
+        "packed_model_repo_path_exists": PACKED_MODEL_REPO_PATH.exists(),
+        "category_counts": dict(sorted(category_counts.items())),
+        "model_type_counts": dict(sorted(type_counts.items())),
+        "asset_totals": asset_totals,
+    }
+
+
+@mcp.tool()
+def search_model_examples(
+    query: str = "",
+    model_type: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """
+    Search the large local Morpheus model corpus and return compact example cards.
+
+    Use read_model_example or read_model_example_section to load selected XML only after search.
+    """
+    return _search_model_example_records(
+        query=query,
+        model_type=model_type,
+        category=category,
+        tags=tags,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def suggest_model_examples_for_paper(run_id: str, limit: int = 5) -> Dict[str, Any]:
+    """Suggest model examples from the local corpus based on the extracted paper text."""
+    try:
+        run_id = _coerce_run_id(run_id)
+        paper_path = _run_dir(run_id) / "paper.txt"
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not paper_path.exists():
+        return {"ok": False, "error": "paper.txt not found for this run"}
+
+    text = _read_text(paper_path, 50_000)
+    reference_categories = _infer_reference_categories_from_text(text)
+    query_terms = _tokenize_model_query(text, limit=80)
+    search_query = " ".join(query_terms)
+    results = _search_model_example_records(query=search_query, limit=limit)
+    return {
+        **results,
+        "run_id": run_id,
+        "reference_category_suggestions": reference_categories,
+    }
+
+
+@mcp.tool()
+def read_model_example(
+    example_id: str,
+    max_chars: int = MAX_MODEL_EXAMPLE_READ_CHARS,
+    include_markdown: bool = True,
+    include_assets: bool = True,
+) -> Dict[str, Any]:
+    """Read a selected Morpheus model example XML from the local corpus."""
+    record, source, records = _find_model_record(example_id)
+    if not record:
+        return {
+            "ok": False,
+            "error": f"Model example not found: {example_id}",
+            "source": source,
+            "record_count": len(records),
+        }
+    max_chars = max(1_000, min(max_chars, MAX_MODEL_EXAMPLE_READ_CHARS))
+    xml_text = _read_model_record_xml(record, max_chars=max_chars)
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "source": source,
+        "example": _public_model_record(record, include_assets=include_assets),
+        "xml": xml_text,
+        "xml_truncated": len(_read_model_record_xml(record, max_chars=MAX_MODEL_EXAMPLE_READ_CHARS)) > len(xml_text),
+        "validation": _validate_xml_completeness(xml_text),
+    }
+    if include_markdown:
+        payload["index_markdown"] = _read_model_record_markdown(record, "index", max_chars=50_000)
+        payload["model_markdown"] = _read_model_record_markdown(record, "model", max_chars=50_000)
+    return payload
+
+
+@mcp.tool()
+def read_model_example_section(
+    example_id: str,
+    section: str,
+    max_chars: int = MAX_MODEL_EXAMPLE_SECTION_CHARS,
+) -> Dict[str, Any]:
+    """Read one XML section, e.g. Analysis, CPM, Global, CellTypes, Space, or Time."""
+    record, source, records = _find_model_record(example_id)
+    if not record:
+        return {
+            "ok": False,
+            "error": f"Model example not found: {example_id}",
+            "source": source,
+            "record_count": len(records),
+        }
+    try:
+        xml_text = _read_model_record_xml(record, max_chars=MAX_MODEL_EXAMPLE_READ_CHARS)
+        section_text, match_count = _extract_xml_section(xml_text, section)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    max_chars = max(1_000, min(max_chars, MAX_MODEL_EXAMPLE_SECTION_CHARS))
+    truncated = len(section_text) > max_chars
+    return {
+        "ok": True,
+        "source": source,
+        "example": _public_model_record(record),
+        "section": section,
+        "match_count": match_count,
+        "content": section_text[:max_chars],
+        "truncated": truncated,
+    }
+
+
+@mcp.tool()
+def list_model_example_assets(example_id: str) -> Dict[str, Any]:
+    """List image/video assets available next to a selected model example."""
+    record, source, records = _find_model_record(example_id)
+    if not record:
+        return {
+            "ok": False,
+            "error": f"Model example not found: {example_id}",
+            "source": source,
+            "record_count": len(records),
+        }
+    return {
+        "ok": True,
+        "source": source,
+        "example": _public_model_record(record),
+        "asset_counts": record.get("asset_counts", {}),
+        "assets": record.get("_assets", []),
     }
 
 
@@ -1282,6 +2018,7 @@ def pdf_to_morpheus_pipeline(pdf_path: str) -> Dict[str, Any]:
     if not extracted.get("ok"):
         return extracted
     refs = suggest_references(extracted["run_id"])
+    model_examples = suggest_model_examples_for_paper(extracted["run_id"], limit=5)
     return {
         "ok": True,
         "run_id": extracted["run_id"],
@@ -1291,8 +2028,11 @@ def pdf_to_morpheus_pipeline(pdf_path: str) -> Dict[str, Any]:
         "paper_text_preview": extracted["text_preview"],
         "suggested_reference_categories": refs.get("suggested_categories", []),
         "available_references": refs.get("available_references", {}),
+        "suggested_model_examples": model_examples.get("results", []),
         "next_steps": [
-            "Use list_references(category) and read_reference(category, name) to study examples.",
+            "Use search_model_examples() or suggested_model_examples to choose relevant corpus examples.",
+            "Use read_model_example_section(example_id, section) before reading full XML.",
+            "Use list_references(category) and read_reference(category, name) only as the legacy curated fallback.",
             "Use write_model_xml() to save Morpheus XML.",
             "Use run_morpheus_model() and evaluate_technical_run() after writing the model.",
         ],

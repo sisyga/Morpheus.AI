@@ -36,6 +36,13 @@ This skill bundles the complete MorpheusML documentation and 43 example models.
 - `references/multiscale-examples.md` -- 12 multiscale examples (CPM + PDE + ODE)
 - `references/miscellaneous-examples.md` -- 5 misc examples (Game of Life, morphogen gradient)
 
+When MCP tools are available, prefer the on-demand model corpus tools for broader example discovery:
+
+- `search_model_examples` -- search the local Morpheus model repository clone or packed fallback
+- `read_model_example_section` -- read only the relevant XML section from a selected example
+- `read_model_example` -- read full selected XML only when section retrieval is insufficient
+- `list_model_example_assets` -- inspect local image/video assets associated with selected examples
+
 ---
 
 ## Instructions
@@ -61,7 +68,7 @@ Determine which type of model the user needs:
 
 ### Step 2: Read Matching Reference File
 
-Open the matching reference file from the list above and pick the closest example model to base the new model on. For example, for a CPM cell sorting model, read `references/cpm-examples.md` and use CellSorting_2D as a starting point.
+Open the matching reference file from the list above or use `search_model_examples` when MCP tools are available. Pick the closest example model to base the new model on. For example, for a CPM cell sorting model, read `references/cpm-examples.md` or search for CPM cell sorting examples and use CellSorting_2D as a starting point.
 
 ### Step 3: Read the Model Template
 
