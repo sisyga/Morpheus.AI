@@ -10,6 +10,7 @@ test("loadConfig reads the default benchmark config", async () => {
   assert.equal(config.maxTurnsPerPaper, 5);
   assert.equal(config.pageRenderDpi, 150);
   assert.ok(config.papersDir.endsWith("benchmark_papers"));
+  assert.ok(config.benchmarkFocusDir?.endsWith("benchmark_focus"));
 });
 
 test("applyCliOverrides resolves local path overrides", async () => {
@@ -17,9 +18,11 @@ test("applyCliOverrides resolves local path overrides", async () => {
   const overridden = applyCliOverrides(config, {
     papersDir: "alt_papers",
     resultsDir: "alt_results",
+    benchmarkFocusDir: "alt_focus",
   });
 
   assert.ok(overridden.papersDir.endsWith("alt_papers"));
   assert.ok(overridden.resultsDir.endsWith("alt_results"));
+  assert.ok(overridden.benchmarkFocusDir?.endsWith("alt_focus"));
   assert.equal(overridden.model, config.model);
 });

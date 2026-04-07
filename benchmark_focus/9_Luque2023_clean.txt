@@ -1,0 +1,1 @@
+HCC tumor growth within the regenerating liver tissue, considering the 2D cross-section of a liver lobule.

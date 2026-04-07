@@ -14,6 +14,10 @@ export async function loadConfig(configPath?: string): Promise<BenchmarkConfig> 
   const config: BenchmarkConfig = {
     papersDir: path.resolve(process.cwd(), parsed.papersDir ?? "benchmark_papers"),
     resultsDir: path.resolve(process.cwd(), parsed.resultsDir ?? "benchmark_runs"),
+    benchmarkFocusDir:
+      parsed.benchmarkFocusDir === null
+        ? null
+        : path.resolve(process.cwd(), parsed.benchmarkFocusDir ?? "benchmark_focus"),
     model: parsed.model ?? "gpt-5.4",
     reasoningEffort: parsed.reasoningEffort ?? "xhigh",
     maxTurnsPerPaper: parsed.maxTurnsPerPaper ?? 5,
@@ -38,6 +42,12 @@ export function applyCliOverrides(
     ...overrides,
     papersDir: overrides.papersDir ? path.resolve(process.cwd(), overrides.papersDir) : config.papersDir,
     resultsDir: overrides.resultsDir ? path.resolve(process.cwd(), overrides.resultsDir) : config.resultsDir,
+    benchmarkFocusDir:
+      overrides.benchmarkFocusDir === undefined
+        ? config.benchmarkFocusDir
+        : overrides.benchmarkFocusDir === null
+          ? null
+          : path.resolve(process.cwd(), overrides.benchmarkFocusDir),
     skillPaths: overrides.skillPaths
       ? overrides.skillPaths.map((skillPath) => path.resolve(process.cwd(), skillPath))
       : config.skillPaths,

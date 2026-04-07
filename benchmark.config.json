@@ -1,6 +1,7 @@
 {
   "papersDir": "benchmark_papers",
   "resultsDir": "benchmark_runs",
+  "benchmarkFocusDir": "benchmark_focus",
   "model": "gpt-5.4",
   "reasoningEffort": "xhigh",
   "maxTurnsPerPaper": 5,

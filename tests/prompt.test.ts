@@ -81,6 +81,7 @@ test("buildCyclePrompt distinguishes another cycle from image review", () => {
   const prompt = buildCyclePrompt({
     paperName: "1_Szabo2010_clean.pdf",
     pdfPath: "benchmark_papers/1_Szabo2010_clean.pdf",
+    focusText: "Monolayer in Fig.10(d) with adhesion alpha=4",
     runId: "run_123",
     runDir: "benchmark_runs/run_123",
     paperTextPath: "benchmark_runs/run_123/paper.txt",
@@ -101,12 +102,14 @@ test("buildCyclePrompt distinguishes another cycle from image review", () => {
   assert.match(prompt, /needsAnotherImageReview=true/i);
   assert.match(prompt, /Always pass run_id="run_123"/);
   assert.match(prompt, /8\/8/);
+  assert.match(prompt, /Primary target for this paper: Monolayer in Fig\.10\(d\)/);
 });
 
 test("buildCyclePrompt carries host continuation reasons into later cycles", () => {
   const prompt = buildCyclePrompt({
     paperName: "ten_Berkhout2025_clean.pdf",
     pdfPath: "benchmark_papers/ten_Berkhout2025_clean.pdf",
+    focusText: "WT Fig.1 and Fig.2",
     runId: "run_berkhout",
     runDir: "benchmark_runs/run_berkhout",
     paperTextPath: "benchmark_runs/run_berkhout/paper.txt",
@@ -126,6 +129,7 @@ test("buildCyclePrompt carries host continuation reasons into later cycles", () 
   });
 
   assert.match(prompt, /Host continuation reason: The reproduction rubric is 5\/8/);
+  assert.match(prompt, /Benchmark focus: WT Fig\.1 and Fig\.2/);
   assert.match(prompt, /run_id=run_berkhout/);
   assert.match(prompt, /do not call create_run/i);
 });

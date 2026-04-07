@@ -3,6 +3,7 @@ export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type BenchmarkConfig = {
   papersDir: string;
   resultsDir: string;
+  benchmarkFocusDir: string | null;
   model: string;
   reasoningEffort: ReasoningEffort;
   maxTurnsPerPaper: number;
@@ -63,6 +64,7 @@ export type PaperRunResult = {
   reproductionReportPath: string | null;
   reproductionReportTextPath: string | null;
   runManifestPath: string | null;
+  benchmarkFocus: string | null;
   summary: string;
   error?: string;
 };

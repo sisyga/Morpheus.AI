@@ -26,6 +26,13 @@ async function main(): Promise<void> {
         overrides.resultsDir = next;
         index += 1;
         break;
+      case "--benchmark-focus-dir":
+        overrides.benchmarkFocusDir = next;
+        index += 1;
+        break;
+      case "--no-benchmark-focus":
+        overrides.benchmarkFocusDir = null;
+        break;
       case "--model":
         overrides.model = next;
         index += 1;
@@ -75,6 +82,8 @@ function printHelp(): void {
       "  --config <path>",
       "  --papers-dir <path>",
       "  --results-dir <path>",
+      "  --benchmark-focus-dir <path>",
+      "  --no-benchmark-focus",
       "  --model <name>",
       "  --reasoning-effort <minimal|low|medium|high|xhigh>",
       "  --max-turns <number>",

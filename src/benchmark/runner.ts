@@ -10,6 +10,7 @@ import {
   FINAL_RESPONSE_SCHEMA,
   parseCycleResponse,
 } from "./prompt.js";
+import { loadPaperFocus } from "./focus.js";
 import { PythonBridge } from "./python-bridge.js";
 import type {
   AgentCycleResponse,
@@ -141,6 +142,7 @@ export class BenchmarkRunner {
   private async processPaper(pdfPath: string): Promise<PaperRunResult> {
     const paper = path.basename(pdfPath);
     const paperStem = sanitizeStem(path.basename(pdfPath, path.extname(pdfPath)));
+    const benchmarkFocus = await loadPaperFocus(this.config.benchmarkFocusDir, pdfPath);
 
     const createRun = (await this.bridge.invoke<{
       run_id: string;
@@ -148,7 +150,16 @@ export class BenchmarkRunner {
       run_manifest_path: string;
     }>("create_run", { name: paperStem })) as CreateRunResult;
     if (!createRun.ok) {
-      return failedResult(paper, pdfPath, `Failed to create run: ${createRun.error ?? "unknown error"}`);
+      return failedResult(
+        paper,
+        pdfPath,
+        `Failed to create run: ${createRun.error ?? "unknown error"}`,
+        "",
+        "",
+        null,
+        null,
+        benchmarkFocus,
+      );
     }
 
     const runId = createRun.run_id;
@@ -161,7 +172,16 @@ export class BenchmarkRunner {
       run_id: runId,
     })) as ExtractPaperResult;
     if (!extract.ok) {
-      return failedResult(paper, pdfPath, `Failed to extract paper text: ${extract.error ?? "unknown error"}`, runId, runDir, createRun.run_manifest_path);
+      return failedResult(
+        paper,
+        pdfPath,
+        `Failed to extract paper text: ${extract.error ?? "unknown error"}`,
+        runId,
+        runDir,
+        createRun.run_manifest_path,
+        null,
+        benchmarkFocus,
+      );
     }
 
     const figureManifest = (await this.bridge.invoke("list_paper_figures", {
@@ -169,7 +189,16 @@ export class BenchmarkRunner {
       run_id: runId,
     })) as FigureManifestResult;
     if (!figureManifest.ok) {
-      return failedResult(paper, pdfPath, `Failed to list PDF figures: ${figureManifest.error ?? "unknown error"}`, runId, runDir, createRun.run_manifest_path);
+      return failedResult(
+        paper,
+        pdfPath,
+        `Failed to list PDF figures: ${figureManifest.error ?? "unknown error"}`,
+        runId,
+        runDir,
+        createRun.run_manifest_path,
+        null,
+        benchmarkFocus,
+      );
     }
 
     const threadOptions: ThreadOptions = {
@@ -197,6 +226,7 @@ export class BenchmarkRunner {
       const prompt = buildCyclePrompt({
         paperName: paper,
         pdfPath,
+        focusText: benchmarkFocus,
         runId,
         runDir,
         paperTextPath: extract.text_path,
@@ -227,6 +257,7 @@ export class BenchmarkRunner {
           runDir,
           createRun.run_manifest_path,
           thread.id,
+          benchmarkFocus,
         );
       }
       completedCycles = cycle;
@@ -243,6 +274,7 @@ export class BenchmarkRunner {
           runDir,
           createRun.run_manifest_path,
           thread.id,
+          benchmarkFocus,
         );
       }
 
@@ -253,6 +285,7 @@ export class BenchmarkRunner {
       if (hasInspectionArtifacts(reviewInspection)) {
         const reviewPrompt = buildImageReviewPrompt({
           paperName: paper,
+          focusText: benchmarkFocus,
           runId,
           cycle,
           paperImagePaths: reviewInspection.paperImagePaths,
@@ -281,6 +314,7 @@ export class BenchmarkRunner {
             runDir,
             createRun.run_manifest_path,
             thread.id,
+            benchmarkFocus,
           );
         }
 
@@ -295,6 +329,7 @@ export class BenchmarkRunner {
             runDir,
             createRun.run_manifest_path,
             thread.id,
+            benchmarkFocus,
           );
         }
 
@@ -352,6 +387,7 @@ export class BenchmarkRunner {
       paper,
       pdfPath,
       runId,
+      benchmarkFocus,
       generatedAt: new Date().toISOString(),
       status,
       reproduction: finalCycle?.reproduction ?? null,
@@ -385,6 +421,7 @@ export class BenchmarkRunner {
       reproductionReportPath: reproductionPath,
       reproductionReportTextPath: reproductionTextPath,
       runManifestPath: createRun.run_manifest_path,
+      benchmarkFocus,
       summary: finalCycle?.summary ?? "No final summary available.",
       error: status === "failed" ? finalCycle?.summary : undefined,
     };
@@ -645,6 +682,7 @@ function formatReproductionReportText(payload: {
   paper: string;
   pdfPath: string;
   runId: string;
+  benchmarkFocus: string | null;
   generatedAt: string;
   status: PaperRunResult["status"];
   reproduction: AgentCycleResponse["reproduction"];
@@ -659,6 +697,7 @@ function formatReproductionReportText(payload: {
     "============================================================",
     `Paper: ${payload.paper}`,
     `PDF Path: ${payload.pdfPath}`,
+    `Benchmark Focus: ${payload.benchmarkFocus ?? "n/a"}`,
     `Run ID: ${payload.runId}`,
     `Timestamp: ${payload.generatedAt}`,
     `Status: ${payload.status}`,
@@ -715,6 +754,7 @@ function failedResult(
   runDir = "",
   runManifestPath: string | null = null,
   threadId: string | null = null,
+  benchmarkFocus: string | null = null,
 ): PaperRunResult {
   return {
     paper,
@@ -729,6 +769,7 @@ function failedResult(
     reproductionReportPath: null,
     reproductionReportTextPath: null,
     runManifestPath,
+    benchmarkFocus,
     summary: error,
     error,
   };

@@ -66,6 +66,7 @@ function criterionSchema() {
 type PromptParams = {
   paperName: string;
   pdfPath: string;
+  focusText?: string | null;
   runId: string;
   runDir: string;
   paperTextPath: string;
@@ -88,6 +89,7 @@ export function buildCyclePrompt(params: PromptParams): string {
   const metadataLines = [
     `Benchmark paper: ${params.paperName}`,
     `PDF path: ${params.pdfPath}`,
+    params.focusText ? `Benchmark focus: ${params.focusText}` : null,
     `Run ID: ${params.runId}`,
     `Run directory: ${params.runDir}`,
     `Paper text path: ${params.paperTextPath}`,
@@ -195,6 +197,16 @@ export function buildCyclePrompt(params: PromptParams): string {
     "</completeness_contract>",
   ].join("\n");
 
+  const focusBlock = params.focusText
+    ? [
+        "<benchmark_focus>",
+        `Primary target for this paper: ${params.focusText}`,
+        "- If the paper contains multiple models or figures, prioritize this target for model design, observable selection, and reproduction scoring.",
+        "- Use other paper context when it supports this target, but do not spend benchmark cycles reproducing unrelated models.",
+        "</benchmark_focus>",
+      ].join("\n")
+    : null;
+
   const verificationBlock = [
     "<verification_loop>",
     "Before setting status=completed:",
@@ -218,17 +230,21 @@ export function buildCyclePrompt(params: PromptParams): string {
 
   return [
     metadataLines,
+    focusBlock,
     toolPersistenceBlock,
     dependencyBlock,
     completenessBlock,
     verificationBlock,
     outputContractBlock,
     dynamicSections,
-  ].join("\n\n");
+  ]
+    .filter((l): l is string => l !== null)
+    .join("\n\n");
 }
 
 type ImageReviewPromptParams = {
   paperName: string;
+  focusText?: string | null;
   runId: string;
   cycle: number;
   paperImagePaths: string[];
@@ -240,6 +256,7 @@ type ImageReviewPromptParams = {
 export function buildImageReviewPrompt(params: ImageReviewPromptParams): string {
   return [
     `Image review follow-up for benchmark paper: ${params.paperName}`,
+    params.focusText ? `Benchmark focus: ${params.focusText}` : "",
     `Run ID: ${params.runId}`,
     `Host cycle: ${params.cycle}`,
     "",
