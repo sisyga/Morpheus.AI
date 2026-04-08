@@ -5,6 +5,7 @@ import sys
 from typing import Any, Callable, Dict
 
 from morpheus_mcp_server import (
+    capture_model_xml_version,
     create_run,
     evaluate_technical_run,
     extract_paper_text,
@@ -30,6 +31,7 @@ COMMANDS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "read_file_text": read_file_text,
     "validate_model_xml": validate_model_xml,
     "write_model_xml": write_model_xml,
+    "capture_model_xml_version": capture_model_xml_version,
     "run_morpheus_model": run_morpheus_model,
     "summarize_morpheus_run": summarize_morpheus_run,
     "sample_output_images": sample_output_images,

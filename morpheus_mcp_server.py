@@ -7,11 +7,16 @@ import re
 import shutil
 import subprocess
 import uuid
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -44,6 +49,8 @@ MAX_REFERENCE_READ_CHARS = 250_000
 MAX_LOG_PREVIEW_CHARS = 1_500
 MAX_OUTPUT_PATHS = 6
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+ATTEMPT_ID_PATTERN = re.compile(r"^attempt_(\d{3})$")
+FIGURE_CAPTION_PATTERN = re.compile(r"\bfig(?:ure)?\.?\s*[A-Za-z]?\s*\d+", re.IGNORECASE)
 
 REFERENCES_ROOT = REPO_ROOT / "references"
 REFERENCE_CATEGORIES = {
@@ -154,17 +161,43 @@ def _read_text_tail(path: Path, max_chars: int = MAX_LOG_PREVIEW_CHARS) -> str:
     return text[-max_chars:]
 
 
-def _merge_manifest(run_id: str, updates: Dict[str, Any]) -> Path:
-    manifest_path = _run_dir(run_id) / "run_manifest.json"
+def _read_text_full(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _manifest_path(run_id: str) -> Path:
+    return _run_dir(run_id) / "run_manifest.json"
+
+
+def _load_manifest(run_id: str) -> Dict[str, Any]:
+    manifest_path = _manifest_path(run_id)
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    else:
-        manifest = {
-            "run_id": run_id,
-            "run_dir": str(_run_dir(run_id)),
-            "created_at": _now_iso(),
-        }
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    return {
+        "run_id": run_id,
+        "run_dir": str(_run_dir(run_id)),
+        "created_at": _now_iso(),
+    }
+
+
+def _merge_manifest(run_id: str, updates: Dict[str, Any]) -> Path:
+    manifest_path = _manifest_path(run_id)
+    manifest = _load_manifest(run_id)
     manifest.update(updates)
+    _write_json(manifest_path, manifest)
+    return manifest_path
+
+
+def _append_manifest_event(run_id: str, key: str, entry: Dict[str, Any]) -> Path:
+    manifest_path = _manifest_path(run_id)
+    manifest = _load_manifest(run_id)
+    existing = manifest.get(key)
+    if not isinstance(existing, list):
+        existing = []
+    existing.append(entry)
+    manifest[key] = existing
     _write_json(manifest_path, manifest)
     return manifest_path
 
@@ -201,6 +234,10 @@ def _output_counts(outputs: Dict[str, List[str]]) -> Dict[str, int]:
     return {key: len(value) for key, value in outputs.items()}
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _time_progress_summary(stdout_text: str) -> Dict[str, Any]:
     time_lines, time_values = _count_time_lines(stdout_text)
     return {
@@ -208,6 +245,73 @@ def _time_progress_summary(stdout_text: str) -> Dict[str, Any]:
         "first_time_value": time_values[0] if time_values else None,
         "last_time_value": time_values[-1] if time_values else None,
     }
+
+
+def _validate_attempt_id(attempt_id: str) -> str:
+    if not ATTEMPT_ID_PATTERN.fullmatch(attempt_id):
+        raise ValueError("attempt_id must match attempt_###, for example attempt_001")
+    return attempt_id
+
+
+def _attempts_root(run_path: Path) -> Path:
+    attempts_root = run_path / "attempts"
+    attempts_root.mkdir(parents=True, exist_ok=True)
+    return attempts_root
+
+
+def _existing_attempt_ids(run_path: Path) -> List[str]:
+    attempts_root = _attempts_root(run_path)
+    attempts = [
+        path.name
+        for path in attempts_root.iterdir()
+        if path.is_dir() and ATTEMPT_ID_PATTERN.fullmatch(path.name)
+    ]
+    return sorted(attempts)
+
+
+def _next_attempt_id(run_path: Path) -> str:
+    indices = [
+        int(match.group(1))
+        for attempt_id in _existing_attempt_ids(run_path)
+        if (match := ATTEMPT_ID_PATTERN.fullmatch(attempt_id))
+    ]
+    next_index = (max(indices) if indices else 0) + 1
+    return f"attempt_{next_index:03d}"
+
+
+def _attempt_dir(run_path: Path, attempt_id: str) -> Path:
+    attempt_id = _validate_attempt_id(attempt_id)
+    attempt_path = (_attempts_root(run_path) / attempt_id).resolve()
+    attempts_root = _attempts_root(run_path).resolve()
+    if attempt_path != attempts_root and attempts_root not in attempt_path.parents:
+        raise ValueError(f"Resolved attempt directory escapes the attempts root: {attempt_path}")
+    return attempt_path
+
+
+def _latest_attempt_id(run_id: str, run_path: Optional[Path] = None) -> Optional[str]:
+    run_path = run_path or _run_dir(run_id)
+    manifest = _load_manifest(run_id)
+    latest_attempt_id = manifest.get("latest_attempt_id")
+    if isinstance(latest_attempt_id, str):
+        attempt_path = _attempt_dir(run_path, latest_attempt_id)
+        if attempt_path.is_dir():
+            return latest_attempt_id
+    existing = _existing_attempt_ids(run_path)
+    return existing[-1] if existing else None
+
+
+def _resolve_attempt(run_id: str, run_path: Path, attempt_id: Optional[str]) -> Tuple[Optional[str], Optional[Path]]:
+    resolved_attempt_id = _validate_attempt_id(attempt_id) if attempt_id else _latest_attempt_id(run_id, run_path)
+    if not resolved_attempt_id:
+        return None, None
+    attempt_path = _attempt_dir(run_path, resolved_attempt_id)
+    if not attempt_path.exists():
+        return None, None
+    return resolved_attempt_id, attempt_path
+
+
+def _non_contact_sheet_pngs(paths: Sequence[str]) -> List[str]:
+    return [path for path in paths if Path(path).name != "sample_contact_sheet.png"]
 
 
 def _which(command: str) -> Optional[str]:
@@ -408,6 +512,50 @@ def _list_pdf_figures(pdf_path: Path) -> List[Dict[str, Any]]:
     return _parse_pdfimages_output(result["stdout"])
 
 
+def _list_pdf_figures_with_pymupdf(pdf_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+    try:
+        import fitz  # type: ignore
+    except ImportError:
+        return [], ["PyMuPDF is not installed, so figure-page heuristic detection is unavailable."]
+
+    warnings = [
+        "pdfimages is unavailable or returned no figures; used PyMuPDF figure-page heuristics based on captions and page graphics."
+    ]
+    figures: List[Dict[str, Any]] = []
+    doc = fitz.open(str(pdf_path))
+    try:
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            text = page.get_text("text") or ""
+            caption_matches = FIGURE_CAPTION_PATTERN.findall(text)
+            image_count = len(page.get_images(full=True))
+            try:
+                drawing_count = len(page.get_drawings())
+            except Exception:
+                drawing_count = 0
+            has_figure_caption = len(caption_matches) > 0
+            has_page_graphics = image_count > 0 or drawing_count > 0
+            if not has_figure_caption or not has_page_graphics:
+                continue
+            figures.append(
+                {
+                    "page": page_index + 1,
+                    "num": len(figures) + 1,
+                    "type": "heuristic_page",
+                    "width": page.rect.width,
+                    "height": page.rect.height,
+                    "caption_matches": caption_matches[:5],
+                    "image_count": image_count,
+                    "drawing_count": drawing_count,
+                }
+            )
+    finally:
+        doc.close()
+    if not figures:
+        warnings.append("No figure pages matched the fallback caption-and-graphics heuristic.")
+    return figures, warnings
+
+
 def _infer_reference_categories_from_text(text: str) -> Dict[str, Any]:
     lower = text.lower()
     scores = {"CPM": 0, "PDE": 0, "ODE": 0, "Multiscale": 0}
@@ -553,6 +701,18 @@ def _count_error_lines(stderr_text: str) -> int:
     return count if count > 0 else len([line for line in stderr_text.splitlines() if line.strip()])
 
 
+def _extract_time_from_png_name(path_value: Optional[str]) -> Optional[float]:
+    if not path_value:
+        return None
+    match = re.search(r"_(\d+(?:\.\d+)?)\.png$", Path(path_value).name)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def _pick_evenly_spaced(items: Sequence[Path], limit: int) -> List[Path]:
     if not items or limit <= 0:
         return []
@@ -604,7 +764,7 @@ def _create_contact_sheet(image_paths: Sequence[Path], output_path: Path) -> Opt
 
 
 def _sample_run_images(run_path: Path, limit: int) -> Dict[str, Any]:
-    pngs = sorted(run_path.rglob("*.png"))
+    pngs = sorted(path for path in run_path.rglob("*.png") if path.name != "sample_contact_sheet.png")
     primary = [path for path in pngs if path.name.startswith("plot_")]
     logger = [path for path in pngs if path.name.startswith("logger_")]
 
@@ -721,6 +881,26 @@ def extract_paper_text(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
     }
 
 
+def _normalize_page_request(
+    total_pages: int,
+    pages: Optional[List[int]],
+    max_pages: Optional[int],
+) -> Tuple[Optional[List[int]], List[int], List[str]]:
+    warnings: List[str] = []
+    requested_pages = list(pages) if pages is not None else None
+    selected_pages = requested_pages or list(range(1, total_pages + 1))
+    out_of_range_pages = [page for page in selected_pages if page < 1 or page > total_pages]
+    if out_of_range_pages:
+        warnings.append(
+            f"Ignored out-of-range pages: {', '.join(str(page) for page in sorted(set(out_of_range_pages)))}."
+        )
+    selected_pages = [page for page in selected_pages if 1 <= page <= total_pages]
+    if max_pages is not None and len(selected_pages) > max_pages:
+        warnings.append(f"Truncated page render request to max_pages={max_pages}.")
+        selected_pages = selected_pages[:max_pages]
+    return requested_pages, selected_pages, warnings
+
+
 @mcp.tool()
 def render_pdf_pages(
     pdf_path: str,
@@ -742,10 +922,18 @@ def render_pdf_pages(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total_pages = _parse_pdf_page_count(pdf_file)
-    selected_pages = pages or list(range(1, total_pages + 1))
-    selected_pages = [page for page in selected_pages if 1 <= page <= total_pages]
-    if max_pages is not None:
-        selected_pages = selected_pages[:max_pages]
+    requested_pages, selected_pages, warnings = _normalize_page_request(total_pages, pages, max_pages)
+    if requested_pages is not None and not selected_pages:
+        return {
+            "ok": False,
+            "error": f"None of the requested pages are within the PDF page range 1..{total_pages}.",
+            "run_id": run_id,
+            "pdf_path": str(pdf_file),
+            "total_pages": total_pages,
+            "requested_pages": requested_pages,
+            "selected_pages": selected_pages,
+            "warnings": warnings,
+        }
 
     try:
         rendered_paths = _render_pdf_pages(pdf_file, out_dir, selected_pages, dpi)
@@ -757,12 +945,20 @@ def render_pdf_pages(
         for page, path in zip(selected_pages, rendered_paths)
     ]
     manifest_path = run_path / "paper_page_manifest.json"
+    if selected_pages and len(page_entries) != len(selected_pages):
+        warnings.append(
+            f"Only rendered {len(page_entries)} of {len(selected_pages)} requested page(s)."
+        )
     _write_json(
         manifest_path,
         {
             "pdf_path": str(pdf_file),
             "dpi": dpi,
+            "total_pages": total_pages,
+            "requested_pages": requested_pages,
+            "selected_pages": selected_pages,
             "pages": page_entries,
+            "warnings": warnings,
             "generated_at": _now_iso(),
         },
     )
@@ -771,6 +967,7 @@ def render_pdf_pages(
         {
             "paper_page_manifest_path": str(manifest_path),
             "paper_page_image_count": len(page_entries),
+            "paper_page_warnings": warnings,
         },
     )
 
@@ -779,7 +976,11 @@ def render_pdf_pages(
         "run_id": run_id,
         "pdf_path": str(pdf_file),
         "dpi": dpi,
+        "total_pages": total_pages,
+        "requested_pages": requested_pages,
+        "selected_pages": selected_pages,
         "pages": page_entries,
+        "warnings": warnings,
         "manifest_path": _relative_to_run(run_path, manifest_path),
     }
 
@@ -796,7 +997,12 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
+    warnings: List[str] = []
     figures = _list_pdf_figures(pdf_file)
+    detection_method = "pdfimages"
+    if not figures:
+        detection_method = "pymupdf_heuristic"
+        figures, warnings = _list_pdf_figures_with_pymupdf(pdf_file)
     figure_pages = sorted({figure["page"] for figure in figures if isinstance(figure.get("page"), int)})
     manifest_path = run_path / "paper_figure_manifest.json"
     _write_json(
@@ -806,6 +1012,8 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
             "generated_at": _now_iso(),
             "figure_count": len(figures),
             "figure_pages": figure_pages,
+            "detection_method": detection_method,
+            "warnings": warnings,
         },
     )
     _merge_manifest(
@@ -813,6 +1021,8 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
         {
             "paper_figure_manifest_path": str(manifest_path),
             "paper_figure_count": len(figures),
+            "paper_figure_detection_method": detection_method,
+            "paper_figure_warnings": warnings,
         },
     )
 
@@ -822,6 +1032,8 @@ def list_paper_figures(pdf_path: str, run_id: Optional[str] = None) -> Dict[str,
         "pdf_path": str(pdf_file),
         "figure_count": len(figures),
         "figure_pages": figure_pages,
+        "detection_method": detection_method,
+        "warnings": warnings,
         "manifest_path": _relative_to_run(run_path, manifest_path),
         "note": "Likely pages containing figures. Render only specific pages when visual inspection is needed.",
     }
@@ -926,10 +1138,102 @@ def write_model_xml(
 
 
 @mcp.tool()
+def capture_model_xml_version(run_id: str, reason: str = "host_captured") -> Dict[str, Any]:
+    try:
+        run_id = _coerce_run_id(run_id)
+        run_path = _run_dir(run_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    xml_path = run_path / "model.xml"
+    if not xml_path.exists():
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "model_present": False,
+            "snapshot_created": False,
+            "reason": reason,
+        }
+
+    current_text = _read_text_full(xml_path)
+    current_hash = _sha256_text(current_text)
+    version_dir = run_path / "xml_versions"
+    version_dir.mkdir(parents=True, exist_ok=True)
+    existing_versions = sorted(version_dir.glob("model_v*.xml"))
+    latest_version_path = existing_versions[-1] if existing_versions else None
+    latest_hash = _sha256_text(_read_text_full(latest_version_path)) if latest_version_path else None
+    if latest_hash == current_hash:
+        manifest_path = _merge_manifest(
+            run_id,
+            {
+                "current_model_xml_path": str(xml_path),
+                "current_model_xml_sha256": current_hash,
+                "latest_xml_version_path": str(latest_version_path) if latest_version_path else None,
+                "xml_version_count": len(existing_versions),
+            },
+        )
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "model_present": True,
+            "snapshot_created": False,
+            "current_model_sha256": current_hash,
+            "latest_version_path": str(latest_version_path) if latest_version_path else None,
+            "xml_version_count": len(existing_versions),
+            "run_manifest_path": str(manifest_path),
+            "reason": reason,
+        }
+
+    version_index = len(existing_versions) + 1
+    version_path = version_dir / f"model_v{version_index:03d}.xml"
+    _write_text(version_path, current_text)
+    validation = _validate_xml_completeness(current_text)
+    manifest_path = _merge_manifest(
+        run_id,
+        {
+            "current_model_xml_path": str(xml_path),
+            "current_model_xml_sha256": current_hash,
+            "latest_xml_version_path": str(version_path),
+            "xml_version_count": version_index,
+            "last_xml_validation": validation,
+            "last_host_captured_xml_version": {
+                "timestamp": _now_iso(),
+                "reason": reason,
+                "version_path": str(version_path),
+                "sha256": current_hash,
+            },
+        },
+    )
+    _append_manifest_event(
+        run_id,
+        "host_captured_xml_versions",
+        {
+            "timestamp": _now_iso(),
+            "reason": reason,
+            "version_path": str(version_path),
+            "sha256": current_hash,
+        },
+    )
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "model_present": True,
+        "snapshot_created": True,
+        "current_model_sha256": current_hash,
+        "version_path": str(version_path),
+        "xml_version_count": version_index,
+        "validation": validation,
+        "run_manifest_path": str(manifest_path),
+        "reason": reason,
+    }
+
+
+@mcp.tool()
 def run_morpheus_model(
     xml_path: str,
     run_id: Optional[str] = None,
     threads: Optional[int] = None,
+    attempt_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     xml_file = Path(xml_path).expanduser().resolve()
     if not xml_file.exists():
@@ -951,7 +1255,18 @@ def run_morpheus_model(
                 "error": f"XML path must be inside the active benchmark run directory: {run_path}",
             }
 
-    command = [MORPHEUS_BIN, "-f", str(xml_file), "--outdir", str(run_path)]
+    resolved_attempt_id = _validate_attempt_id(attempt_id) if attempt_id else _next_attempt_id(run_path)
+    attempt_path = _attempt_dir(run_path, resolved_attempt_id)
+    if attempt_path.exists() and any(attempt_path.iterdir()):
+        return {
+            "ok": False,
+            "error": f"Attempt directory already exists and is not empty: {resolved_attempt_id}",
+        }
+    attempt_path.mkdir(parents=True, exist_ok=True)
+    executed_xml_path = attempt_path / "model.xml"
+    shutil.copy2(xml_file, executed_xml_path)
+
+    command = [MORPHEUS_BIN, "-f", str(xml_file), "--outdir", str(attempt_path)]
     if threads:
         command.extend(["--num-threads", str(threads)])
 
@@ -965,25 +1280,46 @@ def run_morpheus_model(
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
-    stdout_path = run_path / "stdout.log"
-    stderr_path = run_path / "stderr.log"
+    stdout_path = attempt_path / "stdout.log"
+    stderr_path = attempt_path / "stderr.log"
     _write_text(stdout_path, result["stdout"])
     _write_text(stderr_path, result["stderr"])
 
-    outputs = _list_outputs(run_path)
-    primary_pngs = [path for path in outputs["png"] if Path(path).name.startswith("plot_")]
-    logger_pngs = [path for path in outputs["png"] if Path(path).name.startswith("logger_")]
+    outputs = _list_outputs(attempt_path)
+    png_outputs = _non_contact_sheet_pngs(outputs["png"])
+    primary_pngs = [path for path in png_outputs if Path(path).name.startswith("plot_")]
+    logger_pngs = [path for path in png_outputs if Path(path).name.startswith("logger_")]
     stdout_summary = _time_progress_summary(result["stdout"])
     manifest_path = _merge_manifest(
         run_id,
         {
             "last_run_at": _now_iso(),
             "last_run_command": command,
-            "stdout_log_path": str(stdout_path),
-            "stderr_log_path": str(stderr_path),
             "last_run_returncode": result["returncode"],
-            "last_run_png_count": len(outputs["png"]),
+            "last_run_png_count": len(png_outputs),
             "last_run_csv_count": len(outputs["csv"]),
+            "latest_attempt_id": resolved_attempt_id,
+            "latest_attempt_dir": str(attempt_path),
+            "latest_attempt_xml_path": str(executed_xml_path),
+            "latest_attempt_stdout_path": str(stdout_path),
+            "latest_attempt_stderr_path": str(stderr_path),
+            "latest_attempt_returncode": result["returncode"],
+            "latest_attempt_png_count": len(png_outputs),
+            "latest_attempt_csv_count": len(outputs["csv"]),
+        },
+    )
+    _append_manifest_event(
+        run_id,
+        "attempt_history",
+        {
+            "attempt_id": resolved_attempt_id,
+            "attempt_dir": str(attempt_path),
+            "executed_xml_path": str(executed_xml_path),
+            "command": command,
+            "returncode": result["returncode"],
+            "started_at": _now_iso(),
+            "png_count": len(png_outputs),
+            "csv_count": len(outputs["csv"]),
         },
     )
 
@@ -991,7 +1327,10 @@ def run_morpheus_model(
     return {
         "ok": ok,
         "run_id": run_id,
+        "attempt_id": resolved_attempt_id,
+        "attempt_dir": _relative_to_run(run_path, attempt_path),
         "xml_path": _relative_to_run(run_path, xml_file),
+        "executed_xml_path": _relative_to_run(run_path, executed_xml_path),
         "run_dir": str(run_path),
         "returncode": result["returncode"],
         "stdout_path": _relative_to_run(run_path, stdout_path),
@@ -1015,30 +1354,38 @@ def run_morpheus_model(
 
 
 @mcp.tool()
-def summarize_morpheus_run(run_id: str) -> Dict[str, Any]:
+def summarize_morpheus_run(run_id: str, attempt_id: Optional[str] = None) -> Dict[str, Any]:
     try:
         run_id = _coerce_run_id(run_id)
         run_path = _run_dir(run_id)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    outputs = _list_outputs(run_path)
-    stdout_path = run_path / "stdout.log"
-    stderr_path = run_path / "stderr.log"
+    resolved_attempt_id, attempt_path = _resolve_attempt(run_id, run_path, attempt_id)
+    if not resolved_attempt_id or not attempt_path:
+        return {"ok": False, "error": f"No Morpheus attempt exists yet for run_id={run_id}."}
+    outputs = _list_outputs(attempt_path)
+    png_outputs = _non_contact_sheet_pngs(outputs["png"])
+    stdout_path = attempt_path / "stdout.log"
+    stderr_path = attempt_path / "stderr.log"
     xml_path = run_path / "model.xml"
-    primary_pngs = [path for path in outputs["png"] if Path(path).name.startswith("plot_")]
-    logger_pngs = [path for path in outputs["png"] if Path(path).name.startswith("logger_")]
-    stdout_text = _read_text_tail(stdout_path) if stdout_path.exists() else ""
+    executed_xml_path = attempt_path / "model.xml"
+    primary_pngs = [path for path in png_outputs if Path(path).name.startswith("plot_")]
+    logger_pngs = [path for path in png_outputs if Path(path).name.startswith("logger_")]
+    stdout_text = _read_text_full(stdout_path) if stdout_path.exists() else ""
     stderr_text = _read_text_tail(stderr_path) if stderr_path.exists() else ""
 
     return {
         "ok": True,
         "run_id": run_id,
+        "attempt_id": resolved_attempt_id,
+        "attempt_dir": _relative_to_run(run_path, attempt_path),
         "run_dir": str(run_path),
         "xml_path": _relative_to_run(run_path, xml_path) if xml_path.exists() else None,
+        "executed_xml_path": _relative_to_run(run_path, executed_xml_path) if executed_xml_path.exists() else None,
         "stdout_path": _relative_to_run(run_path, stdout_path) if stdout_path.exists() else None,
         "stderr_path": _relative_to_run(run_path, stderr_path) if stderr_path.exists() else None,
         "output_counts": {
-            **_output_counts(outputs),
+            **{**_output_counts(outputs), "png": len(png_outputs)},
             "primary_plot_count": len(primary_pngs),
             "logger_plot_count": len(logger_pngs),
         },
@@ -1046,10 +1393,10 @@ def summarize_morpheus_run(run_id: str) -> Dict[str, Any]:
             "latest_primary_plot": _last_relative(run_path, primary_pngs),
             "latest_logger_plot": _last_relative(run_path, logger_pngs),
             "latest_csv": _last_relative(run_path, outputs["csv"]),
-            "sample_output_paths": _sample_paths(run_path, outputs["png"]),
+            "sample_output_paths": _sample_paths(run_path, png_outputs),
         },
         "time_progress": _time_progress_summary(stdout_text),
-        "stdout_tail": stdout_text,
+        "stdout_tail": _read_text_tail(stdout_path) if stdout_path.exists() else "",
         "stderr_tail": stderr_text,
     }
 
@@ -1059,18 +1406,22 @@ def sample_output_images(
     run_id: str,
     limit: int = 5,
     create_contact_sheet: bool = False,
+    attempt_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         run_id = _coerce_run_id(run_id)
         run_path = _run_dir(run_id)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    sample = _sample_run_images(run_path, limit)
+    resolved_attempt_id, attempt_path = _resolve_attempt(run_id, run_path, attempt_id)
+    if not resolved_attempt_id or not attempt_path:
+        return {"ok": False, "error": f"No Morpheus attempt exists yet for run_id={run_id}."}
+    sample = _sample_run_images(attempt_path, limit)
     selected_paths = [_relative_to_run(run_path, path) for path in sample["selected"]]
     contact_sheet_path: Optional[str] = None
 
     if create_contact_sheet and sample["selected"]:
-        output_path = run_path / "sample_contact_sheet.png"
+        output_path = attempt_path / "sample_contact_sheet.png"
         created = _create_contact_sheet(sample["selected"], output_path)
         if created:
             contact_sheet_path = _relative_to_run(run_path, created)
@@ -1078,6 +1429,8 @@ def sample_output_images(
     return {
         "ok": True,
         "run_id": run_id,
+        "attempt_id": resolved_attempt_id,
+        "attempt_dir": _relative_to_run(run_path, attempt_path),
         "selected_images": selected_paths,
         "primary_plot_count": sample["primary_plot_count"],
         "logger_plot_count": sample["logger_plot_count"],
@@ -1087,39 +1440,57 @@ def sample_output_images(
 
 
 @mcp.tool()
-def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
+def evaluate_technical_run(run_id: str, attempt_id: Optional[str] = None) -> Dict[str, Any]:
     try:
         run_id = _coerce_run_id(run_id)
         run_path = _run_dir(run_id)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     xml_path = run_path / "model.xml"
-    stdout_path = run_path / "stdout.log"
-    stderr_path = run_path / "stderr.log"
     evaluation_json = run_path / "technical_evaluation.json"
     evaluation_txt = run_path / "technical_evaluation.txt"
+    resolved_attempt_id, attempt_path = _resolve_attempt(run_id, run_path, attempt_id)
+    if not resolved_attempt_id or not attempt_path:
+        return {"ok": False, "error": f"No Morpheus attempt exists yet for run_id={run_id}."}
+    stdout_path = attempt_path / "stdout.log"
+    stderr_path = attempt_path / "stderr.log"
 
     xml_text = _read_text(xml_path, max_chars=1_000_000)
-    stdout_text = _read_text(stdout_path, max_chars=1_000_000)
-    stderr_text = _read_text(stderr_path, max_chars=1_000_000)
-    outputs = _list_outputs(run_path)
+    stdout_text = _read_text_full(stdout_path)
+    stderr_text = _read_text_full(stderr_path)
+    outputs = _list_outputs(attempt_path)
+    png_outputs = _non_contact_sheet_pngs(outputs["png"])
     validation = _validate_xml_completeness(xml_text) if xml_text else {}
 
     error_count = _count_error_lines(stderr_text)
     model_graph_present = any(Path(path).name == "model_graph.dot" for path in outputs["dot"])
+    model_graph_matches_xml = bool(validation.get("has_model_graph")) == bool(model_graph_present)
     time_lines, time_values = _count_time_lines(stdout_text)
     time_score = _calculate_time_score(time_lines)
     stop_time = _extract_stop_time(xml_text) if xml_text else None
     last_time = time_values[-1] if time_values else None
     stop_time_match = stop_time is not None and last_time is not None and abs(stop_time - last_time) < 1e-6
-    png_count = len(outputs["png"])
+    png_count = len(png_outputs)
     csv_count = len(outputs["csv"])
     results_score = 1 if (png_count > 0 or csv_count > 0) else 0
     bonus_many_results = 1 if png_count >= 10 else 0
+    model_graph_score = 1 if model_graph_present and bool(validation.get("has_model_graph")) else 0
+    primary_pngs = [path for path in png_outputs if Path(path).name.startswith("plot_")]
+    logger_pngs = [path for path in png_outputs if Path(path).name.startswith("logger_")]
+    latest_primary_plot = _last_relative(run_path, primary_pngs)
+    latest_logger_plot = _last_relative(run_path, logger_pngs)
+    latest_primary_plot_time = _extract_time_from_png_name(latest_primary_plot)
+    latest_logger_plot_time = _extract_time_from_png_name(latest_logger_plot)
+    latest_primary_plot_within_last_time = (
+        latest_primary_plot_time is None or last_time is None or latest_primary_plot_time <= last_time + 1e-6
+    )
+    latest_logger_plot_within_last_time = (
+        latest_logger_plot_time is None or last_time is None or latest_logger_plot_time <= last_time + 1e-6
+    )
 
     raw_score = (
         -error_count
-        + (1 if model_graph_present else 0)
+        + model_graph_score
         + time_score
         + (1 if stop_time_match else 0)
         + results_score
@@ -1131,7 +1502,8 @@ def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
         "xml_error_count": error_count,
         "xml_error_penalty": -error_count,
         "model_graph_present": model_graph_present,
-        "model_graph_score": 1 if model_graph_present else 0,
+        "model_graph_score": model_graph_score,
+        "model_graph_matches_xml": model_graph_matches_xml,
         "time_lines_count": time_lines,
         "time_score": time_score,
         "time_values_sample": time_values[:5],
@@ -1144,11 +1516,19 @@ def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
         "csv_count": csv_count,
         "results_score": results_score,
         "bonus_many_results": bonus_many_results,
+        "latest_primary_plot": latest_primary_plot,
+        "latest_primary_plot_time": latest_primary_plot_time,
+        "latest_primary_plot_within_last_time": latest_primary_plot_within_last_time,
+        "latest_logger_plot": latest_logger_plot,
+        "latest_logger_plot_time": latest_logger_plot_time,
+        "latest_logger_plot_within_last_time": latest_logger_plot_within_last_time,
         "xml_validation": validation,
     }
     payload = {
         "ok": True,
         "run_id": run_id,
+        "attempt_id": resolved_attempt_id,
+        "attempt_dir": _relative_to_run(run_path, attempt_path),
         "total_score": total_score,
         "max_possible_score": 7,
         "score_percentage": round((total_score / 7) * 100, 2),
@@ -1171,12 +1551,13 @@ def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
                 f"TOTAL SCORE: {total_score} / 7 ({payload['score_percentage']}%)",
                 "",
                 f"Error penalty: {-error_count}",
-                f"Model graph: {1 if model_graph_present else 0}/1",
+                f"Model graph: {model_graph_score}/1",
                 f"Time progression: {time_score}/3",
                 f"StopTime match: {1 if stop_time_match else 0}/1",
                 f"Result files: {results_score}/1",
                 f"Bonus (10+ PNGs): {bonus_many_results}/1",
                 "",
+                f"Attempt ID: {resolved_attempt_id}",
                 f"PNG files: {png_count}",
                 f"CSV files: {csv_count}",
             ]
@@ -1188,6 +1569,8 @@ def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
             "technical_evaluation_json_path": str(evaluation_json),
             "technical_evaluation_txt_path": str(evaluation_txt),
             "technical_score": total_score,
+            "technical_attempt_id": resolved_attempt_id,
+            "technical_attempt_dir": str(attempt_path),
         },
     )
     return payload

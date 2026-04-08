@@ -101,6 +101,7 @@ test("buildCyclePrompt distinguishes another cycle from image review", () => {
   assert.match(prompt, /needsAnotherCycle=true/i);
   assert.match(prompt, /needsAnotherImageReview=true/i);
   assert.match(prompt, /Always pass run_id="run_123"/);
+  assert.match(prompt, /Never use shell or command_execution to edit model\.xml/i);
   assert.match(prompt, /8\/8/);
   assert.match(prompt, /Primary target for this paper: Monolayer in Fig\.10\(d\)/);
 });
@@ -132,4 +133,18 @@ test("buildCyclePrompt carries host continuation reasons into later cycles", () 
   assert.match(prompt, /Benchmark focus: WT Fig\.1 and Fig\.2/);
   assert.match(prompt, /run_id=run_berkhout/);
   assert.match(prompt, /do not call create_run/i);
+});
+
+test("buildImageReviewPrompt forbids shell-based model edits during review", () => {
+  const prompt = buildImageReviewPrompt({
+    paperName: "ten_Berkhout2025_clean.pdf",
+    runId: "run_berkhout",
+    cycle: 2,
+    paperImagePaths: ["benchmark_runs/run_berkhout/paper_pages/page_0002.png"],
+    outputImagePaths: ["benchmark_runs/run_berkhout/attempts/attempt_001/plot_00500.png"],
+    contactSheetPath: "benchmark_runs/run_berkhout/attempts/attempt_001/sample_contact_sheet.png",
+    technicalEvaluationPath: "benchmark_runs/run_berkhout/technical_evaluation.json",
+  });
+
+  assert.match(prompt, /Do not use shell or command_execution to edit model\.xml/i);
 });

@@ -1,4 +1,4 @@
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -35,12 +35,18 @@ type ExtractPaperResult = ToolResult<{
 }>;
 
 type RenderPagesResult = ToolResult<{
+  total_pages?: number;
+  requested_pages?: number[] | null;
+  selected_pages?: number[];
   pages: Array<{ page: number; path: string }>;
+  warnings?: string[];
   manifest_path: string;
 }>;
 
 type FigureManifestResult = ToolResult<{
   figure_pages: number[];
+  detection_method?: string;
+  warnings?: string[];
   manifest_path: string;
 }>;
 
@@ -48,6 +54,24 @@ type TechnicalResult = ToolResult<{
   total_score: number;
   max_possible_score?: number;
   evaluation_json_path: string;
+  attempt_id?: string;
+  attempt_dir?: string;
+  breakdown?: {
+    model_graph_matches_xml?: boolean;
+    latest_primary_plot_within_last_time?: boolean;
+    latest_logger_plot_within_last_time?: boolean;
+    latest_primary_plot?: string | null;
+    latest_logger_plot?: string | null;
+    last_time_value?: number | null;
+  };
+}>;
+
+type CaptureModelVersionResult = ToolResult<{
+  model_present: boolean;
+  snapshot_created: boolean;
+  version_path?: string;
+  xml_version_count?: number;
+  run_manifest_path?: string;
 }>;
 
 type CollectedTurn = {
@@ -107,6 +131,13 @@ export class BenchmarkRunner {
       maxRetries: Math.floor(nonNegativeNumber(this.config.codexQuotaMaxRetries)),
       retryBufferMs: secondsToMilliseconds(this.config.codexQuotaRetryBufferSeconds),
     };
+  }
+
+  private captureCanonicalModelVersion(runId: string, reason: string): Promise<CaptureModelVersionResult> {
+    return this.bridge.invoke("capture_model_xml_version", {
+      run_id: runId,
+      reason,
+    }) as Promise<CaptureModelVersionResult>;
   }
 
   async run(maxPapers?: number): Promise<BenchmarkSummary> {
@@ -243,6 +274,7 @@ export class BenchmarkRunner {
     let status: PaperRunResult["status"] = "max_turns";
     let completedCycles = 0;
     let hostContinuationReason: string | undefined;
+    let lastImageReviewOutcome: string | undefined;
 
     for (let cycle = 1; cycle <= this.config.maxTurnsPerPaper; cycle += 1) {
       const prompt = buildCyclePrompt({
@@ -286,6 +318,19 @@ export class BenchmarkRunner {
           benchmarkFocus,
         );
       }
+      const mainTurnVersion = await this.captureCanonicalModelVersion(runId, `cycle_${cycle}_main_turn`);
+      if (!mainTurnVersion.ok) {
+        return failedResult(
+          paper,
+          pdfPath,
+          `Failed to capture canonical model provenance after cycle ${cycle}: ${mainTurnVersion.error ?? "unknown error"}`,
+          runId,
+          runDir,
+          createRun.run_manifest_path,
+          thread.id,
+          benchmarkFocus,
+        );
+      }
       completedCycles = cycle;
 
       let cycleResponse: AgentCycleResponse;
@@ -307,8 +352,11 @@ export class BenchmarkRunner {
       let latestInspection = collectInspectionArtifacts(turn.items, runDir);
       pageManifestPath = latestInspection.pageManifestPath ?? pageManifestPath;
       const reviewInspection = latestInspection;
+      const reviewRequired = hasInspectionArtifacts(reviewInspection);
+      let reviewExecuted = false;
+      let reviewTranscriptPath: string | null = null;
 
-      if (hasInspectionArtifacts(reviewInspection)) {
+      if (reviewRequired) {
         const reviewPrompt = buildImageReviewPrompt({
           paperName: paper,
           focusText: benchmarkFocus,
@@ -331,15 +379,27 @@ export class BenchmarkRunner {
           reviewInput,
           this.quotaFallbackOptions(`${paper} cycle ${cycle} image review`),
         );
-        await writeTranscript(
-          path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`),
-          reviewTurn.events,
-        );
+        reviewTranscriptPath = path.join(runDir, "transcripts", `cycle_${String(cycle).padStart(2, "0")}_review.jsonl`);
+        await writeTranscript(reviewTranscriptPath, reviewTurn.events);
         if (reviewTurn.error) {
           return failedResult(
             paper,
             pdfPath,
             `Failed during image review turn: ${reviewTurn.error}`,
+            runId,
+            runDir,
+            createRun.run_manifest_path,
+            thread.id,
+            benchmarkFocus,
+          );
+        }
+        reviewExecuted = true;
+        const reviewTurnVersion = await this.captureCanonicalModelVersion(runId, `cycle_${cycle}_review_turn`);
+        if (!reviewTurnVersion.ok) {
+          return failedResult(
+            paper,
+            pdfPath,
+            `Failed to capture canonical model provenance after cycle ${cycle} image review: ${reviewTurnVersion.error ?? "unknown error"}`,
             runId,
             runDir,
             createRun.run_manifest_path,
@@ -365,6 +425,35 @@ export class BenchmarkRunner {
 
         latestInspection = collectInspectionArtifacts(reviewTurn.items, runDir);
         pageManifestPath = latestInspection.pageManifestPath ?? pageManifestPath;
+        lastImageReviewOutcome = summarizeImageReviewOutcome(cycle, reviewInspection, cycleResponse.summary);
+      }
+
+      if (reviewRequired && !reviewExecuted) {
+        return failedResult(
+          paper,
+          pdfPath,
+          `Host expected an image review turn in cycle ${cycle}, but it did not run.`,
+          runId,
+          runDir,
+          createRun.run_manifest_path,
+          thread.id,
+          benchmarkFocus,
+        );
+      }
+
+      if (reviewRequired) {
+        await appendImageReviewProvenance(createRun.run_manifest_path, {
+          cycle,
+          required: reviewRequired,
+          executed: reviewExecuted,
+          paperImagePaths: reviewInspection.paperImagePaths,
+          outputImagePaths: reviewInspection.outputImagePaths,
+          contactSheetPath: reviewInspection.contactSheetPath,
+          pageManifestPath: reviewInspection.pageManifestPath,
+          reviewTranscriptPath,
+          reviewSummary: reviewExecuted ? cycleResponse.summary : null,
+          recordedAt: new Date().toISOString(),
+        });
       }
 
       finalCycle = cycleResponse;
@@ -383,8 +472,10 @@ export class BenchmarkRunner {
         technical,
         cycle,
         maxCycles: this.config.maxTurnsPerPaper,
+        reviewRequired,
+        reviewExecuted,
       });
-      hostContinuationReason = continuation.reason ?? undefined;
+      hostContinuationReason = combineContinuationReason(continuation.reason, lastImageReviewOutcome) ?? undefined;
 
       if (continuation.shouldContinue) {
         status = "max_turns";
@@ -459,7 +550,7 @@ export class BenchmarkRunner {
   }
 }
 
-function buildTurnInput(
+export function buildTurnInput(
   prompt: string,
   paperImagePaths: string[],
   outputImagePaths: string[],
@@ -809,9 +900,18 @@ export function decideContinuation(params: {
   technical: TechnicalResult;
   cycle: number;
   maxCycles: number;
+  reviewRequired?: boolean;
+  reviewExecuted?: boolean;
 }): ContinuationDecision {
   if (params.cycle >= params.maxCycles || params.cycleResponse.status === "failed") {
     return { shouldContinue: false, reason: null };
+  }
+
+  if (params.reviewRequired && !params.reviewExecuted) {
+    return {
+      shouldContinue: true,
+      reason: "Inspection artifacts were produced, but the host image-review turn did not run.",
+    };
   }
 
   if (params.cycleResponse.needsAnotherCycle) {
@@ -852,6 +952,27 @@ export function decideContinuation(params: {
     };
   }
 
+  if (params.technical.breakdown?.model_graph_matches_xml === false) {
+    return {
+      shouldContinue: true,
+      reason: "The technical evaluation found a ModelGraph mismatch between the canonical XML and the latest attempt outputs.",
+    };
+  }
+
+  if (params.technical.breakdown?.latest_primary_plot_within_last_time === false) {
+    return {
+      shouldContinue: true,
+      reason: `The latest primary plot (${params.technical.breakdown.latest_primary_plot ?? "unknown"}) exceeds the latest simulated time.`,
+    };
+  }
+
+  if (params.technical.breakdown?.latest_logger_plot_within_last_time === false) {
+    return {
+      shouldContinue: true,
+      reason: `The latest logger plot (${params.technical.breakdown.latest_logger_plot ?? "unknown"}) exceeds the latest simulated time.`,
+    };
+  }
+
   const maxTechnicalScore = params.technical.max_possible_score ?? 7;
   if (params.technical.total_score < maxTechnicalScore) {
     return {
@@ -877,7 +998,26 @@ function uniquePaths(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function collectInspectionArtifacts(items: ThreadItem[], runDir: string): InspectionArtifacts {
+function unwrapStructuredToolPayload(result: unknown): Record<string, unknown> | null {
+  const structured = (result as { structured_content?: unknown } | null)?.structured_content;
+  if (!structured || typeof structured !== "object") {
+    return null;
+  }
+  const maybeNested = structured as { result?: unknown; ok?: boolean };
+  if (maybeNested.ok === false) {
+    return null;
+  }
+  if (maybeNested.result && typeof maybeNested.result === "object") {
+    const nestedResult = maybeNested.result as { ok?: boolean };
+    if (nestedResult.ok === false) {
+      return null;
+    }
+    return maybeNested.result as Record<string, unknown>;
+  }
+  return structured as Record<string, unknown>;
+}
+
+export function collectInspectionArtifacts(items: ThreadItem[], runDir: string): InspectionArtifacts {
   const paperImagePaths = new Set<string>();
   const outputImagePaths = new Set<string>();
   let contactSheetPath: string | null = null;
@@ -889,8 +1029,8 @@ function collectInspectionArtifacts(items: ThreadItem[], runDir: string): Inspec
       continue;
     }
 
-    const payload = toolItem.result?.structured_content ?? null;
-    if (!payload || payload.ok === false) {
+    const payload = unwrapStructuredToolPayload(toolItem.result);
+    if (!payload) {
       continue;
     }
 
@@ -929,6 +1069,39 @@ function collectInspectionArtifacts(items: ThreadItem[], runDir: string): Inspec
 
 function resolveArtifactPath(runDir: string, value: string): string {
   return path.isAbsolute(value) ? value : path.join(runDir, value);
+}
+
+function combineContinuationReason(reason: string | null, reviewOutcome?: string): string | null {
+  if (reason && reviewOutcome) {
+    return `${reason} Prior image review outcome: ${reviewOutcome}`;
+  }
+  return reason ?? reviewOutcome ?? null;
+}
+
+function summarizeImageReviewOutcome(cycle: number, artifacts: InspectionArtifacts, summary: string): string {
+  const paperCount = artifacts.paperImagePaths.length;
+  const outputCount = artifacts.outputImagePaths.length;
+  const contactSheetNote = artifacts.contactSheetPath ? " plus a contact sheet" : "";
+  return `Cycle ${cycle} image review inspected ${paperCount} paper image(s) and ${outputCount} output image(s)${contactSheetNote}. Agent summary: ${summary}`;
+}
+
+async function appendImageReviewProvenance(runManifestPath: string, entry: Record<string, unknown>): Promise<void> {
+  const manifest = (await readJson(runManifestPath)) as Record<string, unknown>;
+  const existing = Array.isArray(manifest.image_review_history)
+    ? (manifest.image_review_history as Record<string, unknown>[])
+    : [];
+  manifest.image_review_history = [...existing, entry];
+  manifest.latest_image_review = entry;
+  await writeJson(runManifestPath, manifest);
+}
+
+async function readJson(inputPath: string): Promise<unknown> {
+  try {
+    const content = await readFile(inputPath, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
 }
 
 async function writeTranscript(outputPath: string, events: ThreadEvent[]): Promise<void> {
