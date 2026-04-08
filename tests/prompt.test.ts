@@ -31,7 +31,7 @@ test("buildCyclePrompt prefers on-demand image inspection", () => {
   assert.match(prompt, /technical_evaluation\.json/);
   assert.match(prompt, /plot_00000\.png/);
   assert.match(prompt, /Likely figure pages: 2, 4/);
-  assert.match(prompt, /render only specific pages/i);
+  assert.match(prompt, /render only the specific relevant pages/i);
   assert.match(prompt, /do not call create_run/i);
 });
 

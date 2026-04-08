@@ -116,8 +116,8 @@ export function buildCyclePrompt(params: PromptParams): string {
       : [
           "No paper page images are attached yet.",
           params.figureManifestPath
-            ? "If you need visual paper inspection, use the figure manifest and render only specific pages with render_pdf_pages(pages=[...])."
-            : "If you need visual paper inspection, render only specific pages with render_pdf_pages(pages=[...]).",
+            ? "If the benchmark focus is a paper figure or complex table, you are expected to use the figure manifest and render only the specific relevant pages with render_pdf_pages(pages=[...]) before final scoring."
+            : "If the benchmark focus is a paper figure or complex table, you are expected to render only the specific relevant pages with render_pdf_pages(pages=[...]) before final scoring.",
         ].join(" ");
 
   const outputSection =
@@ -129,7 +129,7 @@ export function buildCyclePrompt(params: PromptParams): string {
         ]
           .filter((l): l is string => l !== null)
           .join("\n")
-      : "No Morpheus output images are attached to this turn. If you need visual inspection, call sample_output_images after a successful run.";
+      : "No Morpheus output images are attached to this turn. After a successful Morpheus run, sample representative output images before awarding a high observable_alignment score.";
 
   const technicalSection = params.technicalEvaluationPath
     ? `Latest technical evaluation path: ${params.technicalEvaluationPath}`
@@ -184,6 +184,7 @@ export function buildCyclePrompt(params: PromptParams): string {
     "4. run_morpheus_model(...)",
     "5. summarize_morpheus_run(...)",
     "6. evaluate_technical_run(...)",
+    "7. If the benchmark focus is mainly a paper figure, complex table, morphology panel, or output graph comparison, render only the relevant paper pages and sample Morpheus output images; the host will attach them in an immediate follow-up review turn.",
     "Read paper.txt once at the start; reread only if more detail is needed.",
     "Render paper pages or sample output images only when visual inspection is needed; the host will attach them in an immediate follow-up review turn within the same cycle.",
     "Do not assume previously attached images will be reattached in later cycles.",
@@ -193,6 +194,7 @@ export function buildCyclePrompt(params: PromptParams): string {
   const completenessBlock = [
     "<completeness_contract>",
     "- Treat the task as incomplete until: a model runs, technical evaluation passes, the reproduction rubric is filled, and you have judged whether another full benchmark cycle is still needed.",
+    "- If the benchmark focus is a paper figure, complex table, or visual phenotype, treat direct visual comparison against the relevant paper pages and Morpheus outputs as required work, not optional polish.",
     "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, every reproduction criterion is 2/2, total_score is 8/8, technical evaluation is max score, and needsAnotherCycle=false.",
     "- If Morpheus fails and cannot be recovered, set status=failed; reproduction may be null.",
     "</completeness_contract>",
@@ -214,6 +216,8 @@ export function buildCyclePrompt(params: PromptParams): string {
     "- Confirm model.xml exists and ran without fatal errors.",
     "- Confirm technical_evaluation_path exists.",
     "- Confirm the reproduction rubric is fully filled with paper section/figure and output file citations.",
+    "- For figure- or table-focused targets, do not assign observable_alignment=2 or status=completed until you have directly inspected the relevant attached paper figures/tables and sampled Morpheus outputs in a review turn.",
+    "- If any Morpheus plot or graph is empty, missing expected content, visually malformed, or clearly inconsistent with the target figure/table, revise the model or analysis and rerun.",
     "- If reproduction is still partial, coarse, heuristic, missing a cited mechanism, missing a paper observable, or below 8/8, set status=in_progress and needsAnotherCycle=true.",
     "- Reserve status=completed only for a technically maxed, biologically flawless reproduction; imperfect reproductions should keep iterating until the host turn budget runs out.",
     "- If any required artifact is missing, set status=in_progress and state what remains.",
@@ -225,7 +229,7 @@ export function buildCyclePrompt(params: PromptParams): string {
     "- Return exactly the JSON schema provided. No prose, no markdown fences.",
     "- reproduction evidence strings must cite specific paper pages/figures and output files by name.",
     "- Set needsAnotherCycle=true if reproduction is below 8/8, technical evaluation is below max score, or you identified a concrete weakness that another cycle could improve.",
-    "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection.",
+    "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection, such as direct figure/table comparison or checking whether Morpheus plots are empty or visually wrong.",
     "</output_contract>",
   ].join("\n");
 
@@ -264,6 +268,9 @@ export function buildImageReviewPrompt(params: ImageReviewPromptParams): string 
     "This is the immediate image-review follow-up for the current cycle.",
     "The images you requested or generated are attached now.",
     "Inspect them directly before deciding whether the model is a plausible reproduction.",
+    "When relevant to the benchmark focus, visually compare the Morpheus outputs against the attached paper figures or complex tables.",
+    "If any Morpheus graph or plot is empty, missing expected traces/cells, mislabeled, or otherwise visually wrong, treat the reproduction as incomplete and fix the model or analysis.",
+    "Do not give observable_alignment=2 unless direct visual comparison supports it.",
     "Do not reread SKILL.md through a file tool.",
     "Do not use shell or command_execution to edit model.xml, delete files, or clean up artifacts; use write_model_xml for model changes.",
     "Only rerun Morpheus if the images clearly show that the current model is wrong.",

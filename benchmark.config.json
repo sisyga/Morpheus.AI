@@ -10,7 +10,7 @@
   "codexQuotaFallbackEnabled": true,
   "codexQuotaFallbackWaitMinutes": 300,
   "codexQuotaMaxRetries": 3,
-  "codexQuotaRetryBufferSeconds": 60,
+  "codexQuotaRetryBufferSeconds": 61,
   "mcpCommand": ["python", "server.py"],
   "skillPaths": [".agents/skills/morpheus/SKILL.md"]
 }
