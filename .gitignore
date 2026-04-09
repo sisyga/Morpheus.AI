@@ -22,4 +22,6 @@ MWE/
 correction.json
 runs/
 benchmark_runs/
+.tmp_test-runs/
+.tmp_smoke-runs/
 
