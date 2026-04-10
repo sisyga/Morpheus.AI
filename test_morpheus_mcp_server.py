@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import tempfile
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 
 import morpheus_mcp_server as server
@@ -9,9 +10,11 @@ import morpheus_mcp_server as server
 
 class MorpheusMcpServerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tempdir.cleanup)
-        server.RUNS_ROOT = Path(self.tempdir.name)
+        temp_root = server.REPO_ROOT / ".test_tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.run_root = temp_root / uuid.uuid4().hex
+        self.addCleanup(lambda: shutil.rmtree(self.run_root, ignore_errors=True))
+        server.RUNS_ROOT = self.run_root
         server.RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
     def test_write_model_xml_creates_versioned_copies(self) -> None:
@@ -86,6 +89,38 @@ class MorpheusMcpServerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["total_score"], 6)
         self.assertEqual(result["breakdown"]["png_count"], 10)
+
+    def test_write_model_xml_rejects_paths_outside_run_directory(self) -> None:
+        escaped_target = self.run_root.parent / "escaped.xml"
+        result = server.write_model_xml(
+            """
+            <MorpheusModel version="4">
+              <Description><Title>Escape</Title></Description>
+              <Space></Space>
+              <Time></Time>
+              <Analysis><Gnuplotter><Terminal name="png"/></Gnuplotter></Analysis>
+            </MorpheusModel>
+            """,
+            run_id="run_escape",
+            file_name="../escaped.xml",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("run directory", result["error"])
+        self.assertFalse(escaped_target.exists())
+
+    def test_read_file_text_allows_run_files_and_blocks_repo_files(self) -> None:
+        run_path = server._run_dir("run_read")
+        paper_path = run_path / "paper.txt"
+        paper_path.write_text("paper content", encoding="utf-8")
+
+        allowed = server.read_file_text(str(paper_path))
+        blocked = server.read_file_text(str(server.REPO_ROOT / "readme.md"))
+
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(allowed["text"], "paper content")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("only allows files inside", blocked["error"])
 
 
 if __name__ == "__main__":

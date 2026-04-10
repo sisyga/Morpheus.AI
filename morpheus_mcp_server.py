@@ -78,6 +78,52 @@ def _run_dir(run_id: str) -> Path:
     return run_path
 
 
+def _is_within(root: Path, target: Path) -> bool:
+    try:
+        target.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_run_file_path(run_path: Path, requested_path: str) -> Path:
+    if not requested_path or not requested_path.strip():
+        raise ValueError("file_name must not be empty")
+
+    raw_path = Path(requested_path).expanduser()
+    resolved = raw_path.resolve() if raw_path.is_absolute() else (run_path / raw_path).resolve()
+    if not _is_within(run_path, resolved):
+        raise ValueError("file_name must stay within the run directory")
+    if resolved.exists() and resolved.is_dir():
+        raise ValueError("file_name must point to a file, not a directory")
+    return resolved
+
+
+def _allowed_read_roots() -> List[Path]:
+    return [RUNS_ROOT.resolve(), REFERENCES_ROOT.resolve()]
+
+
+def _resolve_allowed_read_path(requested_path: str) -> Path:
+    if not requested_path or not requested_path.strip():
+        raise ValueError("path must not be empty")
+
+    raw_path = Path(requested_path).expanduser()
+    candidates = [raw_path.resolve()] if raw_path.is_absolute() else [
+        (REPO_ROOT / raw_path).resolve(),
+        (RUNS_ROOT / raw_path).resolve(),
+        (REFERENCES_ROOT / raw_path).resolve(),
+    ]
+
+    for candidate in candidates:
+        if any(_is_within(root, candidate) for root in _allowed_read_roots()):
+            return candidate
+
+    allowed_roots = ", ".join(str(root) for root in _allowed_read_roots())
+    raise ValueError(
+        f"Invalid path: {requested_path}. read_file_text only allows files inside {allowed_roots}"
+    )
+
+
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -808,7 +854,11 @@ def write_model_xml(
     if run_id is None:
         run_id = _new_run_id()
     run_path = _run_dir(run_id)
-    xml_path = run_path / file_name
+    try:
+        xml_path = _resolve_run_file_path(run_path, file_name)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
     version_dir = run_path / "xml_versions"
     version_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1086,7 +1136,10 @@ def evaluate_technical_run(run_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def read_file_text(path: str, max_chars: int = MAX_READ_CHARS) -> Dict[str, Any]:
-    file_path = Path(path).expanduser().resolve()
+    try:
+        file_path = _resolve_allowed_read_path(path)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if not file_path.exists() or not file_path.is_file():
         return {"ok": False, "error": f"File not found: {path}"}
     return {"ok": True, "path": str(file_path), "text": _read_text(file_path, max_chars)}
