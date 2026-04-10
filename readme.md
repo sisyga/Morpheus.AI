@@ -62,6 +62,8 @@ The benchmark runner processes papers one at a time and writes all paper-specifi
 
 - `benchmark_papers/`
   Benchmark inputs. The runner scans this folder for PDF files.
+- `benchmark_focus/`
+  Optional per-paper focus prompts. A file named like the PDF stem, for example `ten_Berkhout2025_clean.txt`, is appended to that paper's benchmark prompt.
 - `references/`
   Morpheus examples and raw reference assets. These help the agent understand Morpheus, but they are not benchmark targets.
 - `.agents/skills/morpheus/`
@@ -147,11 +149,13 @@ At the benchmark root, `benchmark_summary.json` aggregates the run status and sc
 - The benchmark uses local Codex authentication. It is intended to run with a locally authenticated Codex CLI rather than direct API-key billing in the harness.
 - Live web search is disabled during benchmark runs. The agent works from the staged paper assets, the local Morpheus reference material, and the Morpheus outputs generated in the run directory.
 - The agent is given paper text up front. Paper page images are not attached by default; instead, the agent can request only the specific figure pages it wants to inspect.
+- If `benchmark_focus/<paper-stem>.txt` exists, the runner tells the agent to prioritize that target when the paper contains multiple models or figures.
 - The agent can also request representative Morpheus output images. When it does so, the runner attaches those images in an immediate follow-up review turn within the same host cycle.
 - A turn is one full host-controlled agent cycle for a paper, not one tool call. Within a single turn, Codex can read references, write XML, run Morpheus, inspect outputs, and return a structured decision about whether another cycle is needed.
 - Images are not automatically reattached in later cycles. If the agent still needs them, it must request them again.
 - The technical score is deterministic, but the reproduction report is a structured qualitative assessment returned by the agent from the staged evidence.
 - Results can vary between runs because the benchmark depends on an LLM-driven modeling loop. In practice, a one-paper smoke test is the best first check, and repeated full runs should be interpreted as distributions rather than perfectly fixed outputs.
+- Codex quota/rate-limit errors are handled by the runner. When the CLI reports a reset time, the runner waits until that time plus `codexQuotaRetryBufferSeconds`; otherwise it waits `codexQuotaFallbackWaitMinutes` before retrying, up to `codexQuotaMaxRetries` per turn. Set `codexQuotaFallbackEnabled` to `false` or pass `--no-codex-quota-fallback` to fail immediately instead.
 
 ## Supported workflow vs. legacy material
 

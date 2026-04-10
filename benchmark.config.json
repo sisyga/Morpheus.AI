@@ -1,11 +1,16 @@
 {
   "papersDir": "benchmark_papers",
   "resultsDir": "benchmark_runs",
+  "benchmarkFocusDir": "benchmark_focus",
   "model": "gpt-5.4",
   "reasoningEffort": "xhigh",
   "maxTurnsPerPaper": 5,
   "pageRenderDpi": 150,
   "representativeOutputFrames": 5,
+  "codexQuotaFallbackEnabled": true,
+  "codexQuotaFallbackWaitMinutes": 300,
+  "codexQuotaMaxRetries": 3,
+  "codexQuotaRetryBufferSeconds": 61,
   "mcpCommand": ["python", "server.py"],
   "skillPaths": [".agents/skills/morpheus/SKILL.md"]
 }

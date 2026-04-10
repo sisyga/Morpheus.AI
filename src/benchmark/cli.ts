@@ -26,6 +26,13 @@ async function main(): Promise<void> {
         overrides.resultsDir = next;
         index += 1;
         break;
+      case "--benchmark-focus-dir":
+        overrides.benchmarkFocusDir = next;
+        index += 1;
+        break;
+      case "--no-benchmark-focus":
+        overrides.benchmarkFocusDir = null;
+        break;
       case "--model":
         overrides.model = next;
         index += 1;
@@ -44,6 +51,21 @@ async function main(): Promise<void> {
         break;
       case "--representative-output-frames":
         overrides.representativeOutputFrames = Number(next);
+        index += 1;
+        break;
+      case "--no-codex-quota-fallback":
+        overrides.codexQuotaFallbackEnabled = false;
+        break;
+      case "--codex-quota-fallback-wait-minutes":
+        overrides.codexQuotaFallbackWaitMinutes = Number(next);
+        index += 1;
+        break;
+      case "--codex-quota-max-retries":
+        overrides.codexQuotaMaxRetries = Number(next);
+        index += 1;
+        break;
+      case "--codex-quota-retry-buffer-seconds":
+        overrides.codexQuotaRetryBufferSeconds = Number(next);
         index += 1;
         break;
       case "--max-papers":
@@ -75,11 +97,17 @@ function printHelp(): void {
       "  --config <path>",
       "  --papers-dir <path>",
       "  --results-dir <path>",
+      "  --benchmark-focus-dir <path>",
+      "  --no-benchmark-focus",
       "  --model <name>",
       "  --reasoning-effort <minimal|low|medium|high|xhigh>",
       "  --max-turns <number>",
       "  --page-render-dpi <number>",
       "  --representative-output-frames <number>",
+      "  --no-codex-quota-fallback",
+      "  --codex-quota-fallback-wait-minutes <number>",
+      "  --codex-quota-max-retries <number>",
+      "  --codex-quota-retry-buffer-seconds <number>",
       "  --max-papers <number>",
     ].join("\n"),
   );

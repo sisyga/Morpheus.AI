@@ -1,0 +1,1 @@
+Model 4 which includes adhesion of cancer cells to senescent cells and apoptosis or extrusion of senescent cells when more than 55% of their perimeter is covered by cancer cells.

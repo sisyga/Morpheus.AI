@@ -66,6 +66,7 @@ function criterionSchema() {
 type PromptParams = {
   paperName: string;
   pdfPath: string;
+  focusText?: string | null;
   runId: string;
   runDir: string;
   paperTextPath: string;
@@ -77,6 +78,7 @@ type PromptParams = {
   cycle: number;
   previousSummary?: string;
   previousReproductionScore?: number | null;
+  hostContinuationReason?: string;
   technicalEvaluationPath?: string | null;
   paperImagePaths: string[];
   outputImagePaths: string[];
@@ -87,6 +89,7 @@ export function buildCyclePrompt(params: PromptParams): string {
   const metadataLines = [
     `Benchmark paper: ${params.paperName}`,
     `PDF path: ${params.pdfPath}`,
+    params.focusText ? `Benchmark focus: ${params.focusText}` : null,
     `Run ID: ${params.runId}`,
     `Run directory: ${params.runDir}`,
     `Paper text path: ${params.paperTextPath}`,
@@ -113,8 +116,8 @@ export function buildCyclePrompt(params: PromptParams): string {
       : [
           "No paper page images are attached yet.",
           params.figureManifestPath
-            ? "If you need visual paper inspection, use the figure manifest and render only specific pages with render_pdf_pages(pages=[...])."
-            : "If you need visual paper inspection, render only specific pages with render_pdf_pages(pages=[...]).",
+            ? "If the benchmark focus is a paper figure or complex table, you are expected to use the figure manifest and render only the specific relevant pages with render_pdf_pages(pages=[...]) before final scoring."
+            : "If the benchmark focus is a paper figure or complex table, you are expected to render only the specific relevant pages with render_pdf_pages(pages=[...]) before final scoring.",
         ].join(" ");
 
   const outputSection =
@@ -126,7 +129,7 @@ export function buildCyclePrompt(params: PromptParams): string {
         ]
           .filter((l): l is string => l !== null)
           .join("\n")
-      : "No Morpheus output images are attached to this turn. If you need visual inspection, call sample_output_images after a successful run.";
+      : "No Morpheus output images are attached to this turn. After a successful Morpheus run, sample representative output images before awarding a high observable_alignment score.";
 
   const technicalSection = params.technicalEvaluationPath
     ? `Latest technical evaluation path: ${params.technicalEvaluationPath}`
@@ -145,6 +148,11 @@ export function buildCyclePrompt(params: PromptParams): string {
       `Continuing from cycle ${params.cycle - 1}. All rules, tool-persistence rules, dependency checks, completeness contract, and verification loop from cycle 1 remain in effect.`,
       params.previousSummary ? `Previous summary: ${params.previousSummary}` : null,
       `Previous reproduction score: ${reproScore}`,
+      params.hostContinuationReason
+        ? `Host continuation reason: ${params.hostContinuationReason}`
+        : null,
+      `Continue improving the existing model in run_id=${params.runId}; do not call create_run or write outside ${params.runDir}.`,
+      "Completion now requires a flawless reproduction rubric (8/8, every criterion 2/2) and max technical score, or no remaining host cycles.",
       "</cycle_continuation>",
     ]
       .filter((l): l is string => l !== null)
@@ -157,6 +165,10 @@ export function buildCyclePrompt(params: PromptParams): string {
     "<tool_persistence_rules>",
     "- Use the Morpheus skill as the source of modeling behavior. Do not read SKILL.md through a file tool; the skill is already loaded.",
     "- Use MCP tools for references, XML writing, Morpheus execution, run summaries, output sampling, and technical evaluation. Do not edit repository source files.",
+    `- Do not call create_run. The host already created run_id=${params.runId} at ${params.runDir}.`,
+    `- Always pass run_id="${params.runId}" to write_model_xml, run_morpheus_model, summarize_morpheus_run, sample_output_images, render_pdf_pages, and evaluate_technical_run.`,
+    '- Always write the canonical model as file_name="model.xml"; do not create paper-specific subfolders.',
+    "- Never use shell or command_execution to edit model.xml, delete files, or clean up the run directory. Use write_model_xml for model changes; read-only shell inspection is allowed only when strictly necessary.",
     "- Do not stop early; keep calling tools until a valid model runs and technical evaluation passes.",
     "- If a tool returns an error, diagnose from the error message and retry with a corrected input.",
     "- Preserve executability first, then use paper images and output images to judge reproduction quality.",
@@ -172,6 +184,7 @@ export function buildCyclePrompt(params: PromptParams): string {
     "4. run_morpheus_model(...)",
     "5. summarize_morpheus_run(...)",
     "6. evaluate_technical_run(...)",
+    "7. If the benchmark focus is mainly a paper figure, complex table, morphology panel, or output graph comparison, render only the relevant paper pages and sample Morpheus output images; the host will attach them in an immediate follow-up review turn.",
     "Read paper.txt once at the start; reread only if more detail is needed.",
     "If a tool returns a path relative to the run directory, join it with the run directory before passing it to read_file_text(...).",
     "Render paper pages or sample output images only when visual inspection is needed; the host will attach them in an immediate follow-up review turn within the same cycle.",
@@ -182,10 +195,21 @@ export function buildCyclePrompt(params: PromptParams): string {
   const completenessBlock = [
     "<completeness_contract>",
     "- Treat the task as incomplete until: a model runs, technical evaluation passes, the reproduction rubric is filled, and you have judged whether another full benchmark cycle is still needed.",
-    "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, and needsAnotherCycle=false.",
+    "- If the benchmark focus is a paper figure, complex table, or visual phenotype, treat direct visual comparison against the relevant paper pages and Morpheus outputs as required work, not optional polish.",
+    "- status=completed only when technical_evaluation_path exists, the reproduction rubric is filled with cited evidence, every reproduction criterion is 2/2, total_score is 8/8, technical evaluation is max score, and needsAnotherCycle=false.",
     "- If Morpheus fails and cannot be recovered, set status=failed; reproduction may be null.",
     "</completeness_contract>",
   ].join("\n");
+
+  const focusBlock = params.focusText
+    ? [
+        "<benchmark_focus>",
+        `Primary target for this paper: ${params.focusText}`,
+        "- If the paper contains multiple models or figures, prioritize this target for model design, observable selection, and reproduction scoring.",
+        "- Use other paper context when it supports this target, but do not spend benchmark cycles reproducing unrelated models.",
+        "</benchmark_focus>",
+      ].join("\n")
+    : null;
 
   const verificationBlock = [
     "<verification_loop>",
@@ -193,8 +217,10 @@ export function buildCyclePrompt(params: PromptParams): string {
     "- Confirm model.xml exists and ran without fatal errors.",
     "- Confirm technical_evaluation_path exists.",
     "- Confirm the reproduction rubric is fully filled with paper section/figure and output file citations.",
-    "- If reproduction is still only partial but you have a concrete next revision, rerun, or evidence-gathering step that could materially improve it, set status=in_progress and needsAnotherCycle=true.",
-    "- Reserve status=completed for a finished attempt, even if the reproduction score is imperfect.",
+    "- For figure- or table-focused targets, do not assign observable_alignment=2 or status=completed until you have directly inspected the relevant attached paper figures/tables and sampled Morpheus outputs in a review turn.",
+    "- If any Morpheus plot or graph is empty, missing expected content, visually malformed, or clearly inconsistent with the target figure/table, revise the model or analysis and rerun.",
+    "- If reproduction is still partial, coarse, heuristic, missing a cited mechanism, missing a paper observable, or below 8/8, set status=in_progress and needsAnotherCycle=true.",
+    "- Reserve status=completed only for a technically maxed, biologically flawless reproduction; imperfect reproductions should keep iterating until the host turn budget runs out.",
     "- If any required artifact is missing, set status=in_progress and state what remains.",
     "</verification_loop>",
   ].join("\n");
@@ -203,24 +229,28 @@ export function buildCyclePrompt(params: PromptParams): string {
     "<output_contract>",
     "- Return exactly the JSON schema provided. No prose, no markdown fences.",
     "- reproduction evidence strings must cite specific paper pages/figures and output files by name.",
-    "- Set needsAnotherCycle=true only if you need another full benchmark cycle after this response.",
-    "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection.",
+    "- Set needsAnotherCycle=true if reproduction is below 8/8, technical evaluation is below max score, or you identified a concrete weakness that another cycle could improve.",
+    "- Set needsAnotherImageReview=true only if that next cycle specifically needs additional paper/output image inspection, such as direct figure/table comparison or checking whether Morpheus plots are empty or visually wrong.",
     "</output_contract>",
   ].join("\n");
 
   return [
     metadataLines,
+    focusBlock,
     toolPersistenceBlock,
     dependencyBlock,
     completenessBlock,
     verificationBlock,
     outputContractBlock,
     dynamicSections,
-  ].join("\n\n");
+  ]
+    .filter((l): l is string => l !== null)
+    .join("\n\n");
 }
 
 type ImageReviewPromptParams = {
   paperName: string;
+  focusText?: string | null;
   runId: string;
   cycle: number;
   paperImagePaths: string[];
@@ -232,15 +262,21 @@ type ImageReviewPromptParams = {
 export function buildImageReviewPrompt(params: ImageReviewPromptParams): string {
   return [
     `Image review follow-up for benchmark paper: ${params.paperName}`,
+    params.focusText ? `Benchmark focus: ${params.focusText}` : "",
     `Run ID: ${params.runId}`,
     `Host cycle: ${params.cycle}`,
     "",
     "This is the immediate image-review follow-up for the current cycle.",
     "The images you requested or generated are attached now.",
     "Inspect them directly before deciding whether the model is a plausible reproduction.",
+    "When relevant to the benchmark focus, visually compare the Morpheus outputs against the attached paper figures or complex tables.",
+    "If any Morpheus graph or plot is empty, missing expected traces/cells, mislabeled, or otherwise visually wrong, treat the reproduction as incomplete and fix the model or analysis.",
+    "Do not give observable_alignment=2 unless direct visual comparison supports it.",
     "Do not reread SKILL.md through a file tool.",
+    "Do not use shell or command_execution to edit model.xml, delete files, or clean up artifacts; use write_model_xml for model changes.",
     "Only rerun Morpheus if the images clearly show that the current model is wrong.",
-    "If you still need another benchmark cycle after this review turn, set needsAnotherCycle=true.",
+    "Do not call create_run; continue using the existing run_id only.",
+    "If reproduction is below 8/8, technical evaluation is below max score, or you identified a concrete weakness, set needsAnotherCycle=true.",
     "Set needsAnotherImageReview=true only if that next cycle specifically needs more image inspection.",
     params.paperImagePaths.length > 0 ? `Attached paper image paths: ${params.paperImagePaths.join(", ")}` : "",
     params.outputImagePaths.length > 0 ? `Attached output image paths: ${params.outputImagePaths.join(", ")}` : "",

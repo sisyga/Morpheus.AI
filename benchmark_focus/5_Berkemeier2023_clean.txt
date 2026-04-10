@@ -1,0 +1,1 @@
+Fig.1(f) with epsilon=1

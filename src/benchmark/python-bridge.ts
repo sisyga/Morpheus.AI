@@ -14,6 +14,7 @@ type PythonToolName =
   | "read_file_text"
   | "validate_model_xml"
   | "write_model_xml"
+  | "capture_model_xml_version"
   | "run_morpheus_model"
   | "summarize_morpheus_run"
   | "sample_output_images"

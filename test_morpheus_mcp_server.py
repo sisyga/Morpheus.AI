@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import unittest
 import uuid
+from unittest import mock
 from pathlib import Path
 
 import morpheus_mcp_server as server
@@ -14,8 +15,14 @@ class MorpheusMcpServerTests(unittest.TestCase):
         temp_root.mkdir(parents=True, exist_ok=True)
         self.run_root = temp_root / uuid.uuid4().hex
         self.addCleanup(lambda: shutil.rmtree(self.run_root, ignore_errors=True))
+        self.original_runs_root = server.RUNS_ROOT
         server.RUNS_ROOT = self.run_root
         server.RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: setattr(server, "RUNS_ROOT", self.original_runs_root))
+        self.env_patch = mock.patch.dict("os.environ", {}, clear=False)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        server.os.environ.pop(server.ACTIVE_RUN_ID_ENV, None)
 
     def test_write_model_xml_creates_versioned_copies(self) -> None:
         result = server.write_model_xml(
@@ -36,10 +43,12 @@ class MorpheusMcpServerTests(unittest.TestCase):
 
     def test_sample_output_images_prefers_primary_frames(self) -> None:
         run_path = server._run_dir("run_images")
+        attempt_path = server._attempt_dir(run_path, "attempt_001")
+        attempt_path.mkdir(parents=True, exist_ok=True)
         for index in range(10):
-            (run_path / f"plot_{index:05d}.png").write_text("x", encoding="utf-8")
-        (run_path / "logger_plot_00000.png").write_text("x", encoding="utf-8")
-        (run_path / "logger_plot_00009.png").write_text("x", encoding="utf-8")
+            (attempt_path / f"plot_{index:05d}.png").write_text("x", encoding="utf-8")
+        (attempt_path / "logger_plot_00000.png").write_text("x", encoding="utf-8")
+        (attempt_path / "logger_plot_00009.png").write_text("x", encoding="utf-8")
 
         result = server.sample_output_images("run_images", limit=5)
         self.assertTrue(result["ok"])
@@ -58,8 +67,38 @@ class MorpheusMcpServerTests(unittest.TestCase):
         """
         self.assertEqual(server._extract_stop_time(xml), 40.0)
 
+    def test_validation_accepts_single_quoted_png_terminal(self) -> None:
+        validation = server._validate_xml_completeness(
+            """
+            <MorpheusModel version='4'>
+              <Description><Title>Eval</Title></Description>
+              <Space></Space>
+              <Time></Time>
+              <Analysis><Gnuplotter><Terminal name='png'/></Gnuplotter></Analysis>
+            </MorpheusModel>
+            """
+        )
+        self.assertTrue(validation["has_gnuplotter"])
+
+    def test_create_run_reuses_existing_run_id_name(self) -> None:
+        existing = server._run_dir("20260402_201012_ten_Berkhout2025_clean")
+        result = server.create_run("20260402_201012_ten_Berkhout2025_clean")
+        self.assertTrue(result["ok"])
+        self.assertEqual(Path(result["run_dir"]), existing)
+        self.assertEqual(result["run_id"], "20260402_201012_ten_Berkhout2025_clean")
+
+    def test_active_run_forces_create_run_to_noop(self) -> None:
+        server.os.environ[server.ACTIVE_RUN_ID_ENV] = "active_run"
+        result = server.create_run("some_other_name")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "active_run")
+        self.assertTrue((server.RUNS_ROOT / "active_run").exists())
+        self.assertFalse((server.RUNS_ROOT / "some_other_name").exists())
+
     def test_evaluate_technical_run_preserves_legacy_score(self) -> None:
         run_path = server._run_dir("run_eval")
+        attempt_path = server._attempt_dir(run_path, "attempt_001")
+        attempt_path.mkdir(parents=True, exist_ok=True)
         (run_path / "model.xml").write_text(
             """
             <MorpheusModel version="4">
@@ -75,15 +114,15 @@ class MorpheusMcpServerTests(unittest.TestCase):
             """,
             encoding="utf-8",
         )
-        (run_path / "stdout.log").write_text(
+        (attempt_path / "stdout.log").write_text(
             "\n".join(["Time: 0", "Time: 500", "Time: 1000"]),
             encoding="utf-8",
         )
-        (run_path / "stderr.log").write_text("", encoding="utf-8")
-        (run_path / "model_graph.dot").write_text("graph", encoding="utf-8")
+        (attempt_path / "stderr.log").write_text("", encoding="utf-8")
+        (attempt_path / "model_graph.dot").write_text("graph", encoding="utf-8")
         for index in range(10):
-            (run_path / f"plot_{index:05d}.png").write_text("x", encoding="utf-8")
-        (run_path / "logger.csv").write_text("x", encoding="utf-8")
+            (attempt_path / f"plot_{index:05d}.png").write_text("x", encoding="utf-8")
+        (attempt_path / "logger.csv").write_text("x", encoding="utf-8")
 
         result = server.evaluate_technical_run("run_eval")
         self.assertTrue(result["ok"])
