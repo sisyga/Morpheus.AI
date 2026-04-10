@@ -61,12 +61,7 @@ REFERENCE_CATEGORIES = {
     "Miscellaneous": REFERENCES_ROOT / "Miscellaneous",
 }
 
-mcp = FastMCP(
-    name="morpheus-mcp",
-    host="0.0.0.0",
-    port=0,
-    stateless_http=True,
-)
+mcp = FastMCP(name="morpheus-mcp")
 
 
 def _now_iso() -> str:

@@ -71,11 +71,13 @@ The benchmark runner processes papers one at a time and writes all paper-specifi
 - `src/benchmark/`
   TypeScript benchmark runner built on the Codex SDK.
 - `server.py`
-  MCP server entry point.
+  MCP server entry point. The supported transport is stdio.
 - `morpheus_mcp_server.py`
   Python implementation of the deterministic Morpheus and PDF utilities.
 - `morpheus_tools_cli.py`
   JSON bridge used by the benchmark runner.
+- `.mcp.json`
+  Machine-readable MCP startup contract for local clients.
 - `benchmark.config.json`
   Default benchmark configuration.
 - `Archive/`
@@ -110,6 +112,31 @@ To see available CLI options:
 ```powershell
 npm run benchmark -- --help
 ```
+
+## Direct MCP usage
+
+The repository's supported MCP transport is **stdio**. The benchmark runner uses the same contract internally, and the repo-root `.mcp.json` exposes it for local MCP clients.
+
+Equivalent startup forms are:
+
+```powershell
+python server.py
+```
+
+or via `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "morpheus": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
+```
+
+This repo does not currently advertise an HTTP `/mcp` endpoint as a supported integration surface.
 
 The benchmark default is now `maxTurnsPerPaper = 5`. This can be overridden on the command line:
 

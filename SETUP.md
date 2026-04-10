@@ -241,6 +241,31 @@ Important fields:
 - `skillPaths`
   Skills enabled for the Codex run.
 
+## 10a. Direct MCP contract
+
+Outside the benchmark harness, the supported MCP transport for this repository is **stdio**.
+
+The canonical local startup command is:
+
+```powershell
+python server.py
+```
+
+The same contract is also written to the repo-root `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "morpheus": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
+```
+
+This repository does not currently document or support an HTTP `/mcp` transport for the Morpheus server.
+
 ## 11. Read the outputs
 
 The main files to inspect are:
